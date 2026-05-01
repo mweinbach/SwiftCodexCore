@@ -283,12 +283,14 @@ public enum ProjectInstructionLoader {
 
     static func findRepositoryRoot(from start: URL) -> URL? {
         let fm = FileManager.default
-        var current = start.standardizedFileURL
+        var currentPath = start.standardizedFileURL.path
         while true {
-            if fm.fileExists(atPath: current.appendingPathComponent(".git").path) { return current }
-            let parent = current.deletingLastPathComponent()
-            if parent.path == current.path { return nil }
-            current = parent
+            if fm.fileExists(atPath: (currentPath as NSString).appendingPathComponent(".git")) {
+                return URL(fileURLWithPath: currentPath, isDirectory: true)
+            }
+            let parentPath = (currentPath as NSString).deletingLastPathComponent
+            if parentPath == currentPath || parentPath.isEmpty { return nil }
+            currentPath = parentPath
         }
     }
 

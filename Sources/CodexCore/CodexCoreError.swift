@@ -2,6 +2,7 @@ import Foundation
 
 public enum CodexCoreError: Error, Sendable, Equatable, CustomStringConvertible {
     case invalidJSON(String)
+    case invalidInput(String)
     case invalidState(String)
     case missingThread(String)
     case missingTool(String)
@@ -16,6 +17,7 @@ public enum CodexCoreError: Error, Sendable, Equatable, CustomStringConvertible 
     public var description: String {
         switch self {
         case .invalidJSON(let message): return "Invalid JSON: \(message)"
+        case .invalidInput(let message): return "Invalid input: \(message)"
         case .invalidState(let message): return "Invalid state: \(message)"
         case .missingThread(let id): return "Missing thread: \(id)"
         case .missingTool(let name): return "Missing tool: \(name)"

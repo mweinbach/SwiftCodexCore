@@ -156,6 +156,20 @@ Project instruction injection follows the Codex pattern: global `CODEX_HOME`/`~/
 
 Skill injection uses progressive disclosure: the system prompt gets a capped catalog of discovered skills, while full `SKILL.md` content is injected only when a skill is explicitly mentioned, e.g. `$report-writer`, or when simple implicit matching selects it.
 
+iOS apps can bundle skills as data and materialize them into an app-container skill root before starting a turn:
+
+```swift
+var config = AgentConfiguration(workspaceURL: workspaceURL)
+try config.installEmbeddedSkills([
+    EmbeddedAgentSkill(
+        name: "artifact-writer",
+        description: "Create document, presentation, and spreadsheet artifacts.",
+        instructions: "Use the host-provided artifact runtime before inventing a renderer."
+    )
+], rootURL: appSupport.appendingPathComponent("EmbeddedSkills", isDirectory: true))
+// The skill is now callable as $artifact-writer through the normal registry.
+```
+
 Hosted Responses tools can be added alongside local Swift function tools:
 
 ```swift

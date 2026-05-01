@@ -155,6 +155,62 @@ final class CodexCoreTests: XCTestCase {
         XCTAssertTrue(prefixText.contains("Always include completed work"))
     }
 
+    func testEmbeddedSkillsMaterializeAndActivateThroughNormalRegistry() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("SwiftCodexCoreTests-\(UUID().uuidString)")
+        let work = root.appendingPathComponent("workspace")
+        let skillsRoot = root.appendingPathComponent("BundledSkills", isDirectory: true)
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let embedded = EmbeddedAgentSkill(
+            name: "artifact-writer",
+            description: "Create document, presentation, and spreadsheet artifacts.",
+            instructions: "Use the host-provided artifact runtime before inventing a renderer.",
+            files: [
+                EmbeddedSkillFile(relativePath: "scripts/render.mjs", contents: "export const runtime = 'ios';\n")
+            ],
+            allowImplicitInvocation: false
+        )
+        var config = AgentConfiguration(
+            workspaceURL: work,
+            skillOptions: SkillInjectionOptions(
+                includeRepoSkills: false,
+                includeUserSkills: false,
+                includeAdminSkills: false,
+                allowImplicitInvocation: true
+            )
+        )
+
+        let installed = try config.installEmbeddedSkills([embedded], rootURL: skillsRoot)
+        XCTAssertEqual(installed.map(\.skill.name), ["artifact-writer"])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: skillsRoot.appendingPathComponent("artifact-writer/SKILL.md").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: skillsRoot.appendingPathComponent("artifact-writer/scripts/render.mjs").path))
+        XCTAssertEqual(config.skillOptions.additionalSkillRoots, [skillsRoot])
+
+        let implicit = try PromptAssembler.build(configuration: config, userText: "Please create a polished artifact")
+        XCTAssertTrue(implicit.availableSkills.contains { $0.name == "artifact-writer" })
+        XCTAssertTrue(implicit.activatedSkills.isEmpty)
+
+        let explicit = try PromptAssembler.build(configuration: config, userText: "$artifact-writer make the deck")
+        XCTAssertEqual(explicit.activatedSkills.map(\.name), ["artifact-writer"])
+        let prefixText = explicit.inputPrefixItems.map(\.description).joined(separator: "\n")
+        XCTAssertTrue(prefixText.contains("host-provided artifact runtime"))
+    }
+
+    func testEmbeddedSkillInstallerRejectsEscapingFiles() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("SwiftCodexCoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let embedded = EmbeddedAgentSkill(
+            name: "bad-skill",
+            description: "Invalid skill",
+            instructions: "No-op",
+            files: [EmbeddedSkillFile(relativePath: "../escape.txt", contents: "nope")]
+        )
+
+        XCTAssertThrowsError(try EmbeddedSkillInstaller.install([embedded], into: root))
+    }
+
     func testCodexAuthCacheRoundTripAndJWTExtraction() throws {
         let exp = Int(Date().addingTimeInterval(3600).timeIntervalSince1970)
         let accessPayload: JSONValue = .object([

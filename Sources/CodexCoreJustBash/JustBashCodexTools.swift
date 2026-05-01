@@ -20,6 +20,8 @@ public enum JustBashCodexFactory {
         workspaceRootURL: URL,
         username: String = "coder",
         configuration: AgentConfiguration = AgentConfiguration(),
+        embeddedSkills: [EmbeddedAgentSkill] = [],
+        embeddedSkillsRootName: String = ".codex/embedded-skills",
         threadStore: any ThreadStore = JSONFileThreadStore(),
         approvalHandler: ApprovalHandler? = nil
     ) throws -> JustBashCodexEnvironment {
@@ -27,6 +29,10 @@ public enum JustBashCodexFactory {
         let bash = Bash(options: options)
         var config = configuration
         config.workspaceURL = workspaceRootURL
+        if !embeddedSkills.isEmpty {
+            let skillsRoot = workspaceRootURL.appendingPathComponent(embeddedSkillsRootName, isDirectory: true)
+            _ = try config.installEmbeddedSkills(embeddedSkills, rootURL: skillsRoot)
+        }
         let runtime = CodexRuntime(
             configuration: config,
             modelProvider: modelProvider,
