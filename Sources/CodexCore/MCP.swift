@@ -62,6 +62,7 @@ public struct MCPResource: Codable, Sendable, Equatable, Identifiable {
 
 public protocol MCPClient: Sendable {
     var name: String { get }
+    var requiresNetworkAccess: Bool { get }
     func connect() async throws
     func initialize() async throws -> MCPServerInfo?
     func listTools() async throws -> [MCPTool]
@@ -72,6 +73,7 @@ public protocol MCPClient: Sendable {
 }
 
 public extension MCPClient {
+    var requiresNetworkAccess: Bool { false }
     func listResources() async throws -> [MCPResource] { [] }
     func readResource(uri: String) async throws -> ToolResult { throw CodexCoreError.unsupported("MCP resources are not implemented by this client") }
 }
@@ -216,6 +218,7 @@ public actor StdioMCPClient: MCPClient {
 
 public final class StreamableHTTPMCPClient: MCPClient, Sendable {
     public let name: String
+    public let requiresNetworkAccess = true
     private let endpoint: URL
     private let bearerToken: String?
     private let session: URLSession
@@ -336,7 +339,10 @@ public struct MCPToolAdapter: AgentTool {
     }
 
     public func run(arguments: JSONValue, context: ToolExecutionContext) async throws -> ToolResult {
-        try await client.callTool(name: tool.name, arguments: arguments)
+        guard !client.requiresNetworkAccess || context.sandboxPolicy.allowNetwork else {
+            throw CodexCoreError.approvalRequired("MCP tool \(definition.name) requires network access, but network is disabled by the sandbox policy")
+        }
+        return try await client.callTool(name: tool.name, arguments: arguments)
     }
 }
 

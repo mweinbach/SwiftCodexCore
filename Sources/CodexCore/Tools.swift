@@ -52,6 +52,7 @@ public struct ToolExecutionContext: Sendable {
     public var approvalPolicy: ApprovalPolicy
     public var sandboxPolicy: SandboxPolicy
     public var approvalHandler: ApprovalHandler?
+    public var approvalEventHandler: (@Sendable (ApprovalRequest) async -> Void)?
     public var metadata: [String: JSONValue]
 
     public init(
@@ -61,6 +62,7 @@ public struct ToolExecutionContext: Sendable {
         approvalPolicy: ApprovalPolicy,
         sandboxPolicy: SandboxPolicy,
         approvalHandler: ApprovalHandler? = nil,
+        approvalEventHandler: (@Sendable (ApprovalRequest) async -> Void)? = nil,
         metadata: [String: JSONValue] = [:]
     ) {
         self.threadID = threadID
@@ -69,6 +71,7 @@ public struct ToolExecutionContext: Sendable {
         self.approvalPolicy = approvalPolicy
         self.sandboxPolicy = sandboxPolicy
         self.approvalHandler = approvalHandler
+        self.approvalEventHandler = approvalEventHandler
         self.metadata = metadata
     }
 }
@@ -129,6 +132,7 @@ public actor ToolRegistry {
             arguments: arguments,
             reason: "Tool \(definition.name) requested execution"
         )
+        await context.approvalEventHandler?(request)
         let decision = try await approvalHandler(request)
         guard decision.approved else {
             throw CodexCoreError.approvalRequired(decision.message ?? "Tool \(definition.name) was rejected")

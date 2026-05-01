@@ -91,12 +91,105 @@ final class CodexCoreTests: XCTestCase {
         ])
         let runtime = CodexRuntime(modelProvider: provider, tools: [])
         let thread = try await runtime.createThread()
-        let handle = await runtime.startTurn(threadID: thread.id, input: TurnInput("go"))
+        let handle = try await runtime.startTurn(threadID: thread.id, input: TurnInput("go"))
 
         for try await _ in handle.events {}
 
         let active = await runtime.activeTurn(threadID: thread.id)
         XCTAssertNil(active)
+    }
+
+    func testRuntimeRejectsOverlappingTurnsOnSameThread() async throws {
+        let provider = DelayedModelProvider(delayNanoseconds: 500_000_000)
+        let runtime = CodexRuntime(modelProvider: provider, tools: [])
+        let thread = try await runtime.createThread()
+        let handle = try await runtime.startTurn(threadID: thread.id, input: TurnInput("first"))
+
+        do {
+            _ = try await runtime.startTurn(threadID: thread.id, input: TurnInput("second"))
+            XCTFail("Expected overlapping turn to fail")
+        } catch CodexCoreError.invalidState(let message) {
+            XCTAssertTrue(message.contains("already has active turn"))
+        }
+
+        await handle.interrupt()
+        for try await _ in handle.events {}
+    }
+
+    func testNetworkServerToolsAreFilteredWhenSandboxDisallowsNetwork() async throws {
+        let provider = RecordingModelProvider(batches: [
+            [.outputTextDelta("done"), .completed(responseID: "r1", usage: nil)]
+        ])
+        let config = AgentConfiguration(
+            sandboxPolicy: .workspaceWrite,
+            serverTools: [
+                .webSearch(searchContextSize: "medium"),
+                .imageGeneration(model: "gpt-image-2"),
+                .raw(type: "local_preview")
+            ]
+        )
+        let agent = CodexAgent(configuration: config, modelProvider: provider, toolRegistry: ToolRegistry(), threadManager: ThreadManager(store: InMemoryThreadStore()))
+        let thread = try await agent.createThread()
+        let handle = agent.startTurn(threadID: thread.id, input: TurnInput("no network tools"))
+        for try await _ in handle.events {}
+
+        let request = try XCTUnwrap(provider.requests.first)
+        XCTAssertEqual(request.tools.map(\.type), ["local_preview"])
+    }
+
+    func testToolApprovalRequestsAreEmittedOnEventStream() async throws {
+        let provider = ScriptedModelProvider(batches: [
+            [
+                .toolCallCompleted(ToolCall(callID: "approve", name: "approval_echo", arguments: #"{"text":"approved"}"#)),
+                .completed(responseID: "r1", usage: nil)
+            ],
+            [
+                .outputTextDelta("done"),
+                .completed(responseID: "r2", usage: nil)
+            ]
+        ])
+        let config = AgentConfiguration(approvalPolicy: .always)
+        let agent = CodexAgent(
+            configuration: config,
+            modelProvider: provider,
+            toolRegistry: ToolRegistry(tools: [ApprovalEchoTool()]),
+            threadManager: ThreadManager(store: InMemoryThreadStore()),
+            approvalHandler: { request in
+                ApprovalDecision(approved: request.toolName == "approval_echo")
+            }
+        )
+        let thread = try await agent.createThread()
+        let handle = agent.startTurn(threadID: thread.id, input: TurnInput("write a file"))
+        var sawApproval = false
+        for try await event in handle.events {
+            if case .approvalRequested(let request) = event {
+                sawApproval = request.toolName == "approval_echo"
+            }
+        }
+        XCTAssertTrue(sawApproval)
+    }
+
+    func testToolContinuationUsesPreviousResponseID() async throws {
+        let provider = RecordingModelProvider(batches: [
+            [
+                .toolCallCompleted(ToolCall(callID: "call_echo", name: "echo", arguments: #"{"text":"pong"}"#)),
+                .completed(responseID: "r1", usage: nil)
+            ],
+            [
+                .outputTextDelta("pong"),
+                .completed(responseID: "r2", usage: nil)
+            ]
+        ])
+        let agent = CodexAgent(modelProvider: provider, toolRegistry: ToolRegistry(tools: [EchoTool()]), threadManager: ThreadManager(store: InMemoryThreadStore()))
+        let thread = try await agent.createThread()
+        let handle = agent.startTurn(threadID: thread.id, input: TurnInput("ping"))
+        for try await _ in handle.events {}
+
+        XCTAssertEqual(provider.requests.count, 2)
+        XCTAssertNil(provider.requests[0].previousResponseID)
+        XCTAssertEqual(provider.requests[1].previousResponseID, "r1")
+        XCTAssertEqual(provider.requests[1].input.count, 1)
+        XCTAssertEqual(provider.requests[1].input.first?["type"]?.stringValue, "function_call_output")
     }
 
     func testThreadForkRollback() async throws {
@@ -197,6 +290,55 @@ final class CodexCoreTests: XCTestCase {
         XCTAssertTrue(prefixText.contains("host-provided artifact runtime"))
     }
 
+    func testSkillDiscoveryRecursesAdditionalRoots() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("SwiftCodexCoreTests-\(UUID().uuidString)")
+        let work = root.appendingPathComponent("workspace")
+        let skillDir = root.appendingPathComponent("skills/productivity/report-writer")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: skillDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try """
+        ---
+        name: report-writer
+        description: Write concise engineering status reports.
+        ---
+
+        Include validation and risks.
+        """.write(to: skillDir.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+
+        let config = AgentConfiguration(
+            workspaceURL: work,
+            projectInstructionOptions: ProjectInstructionOptions(enabled: false),
+            skillOptions: SkillInjectionOptions(
+                includeRepoSkills: false,
+                includeUserSkills: false,
+                includeAdminSkills: false,
+                includeSystemSkills: false,
+                additionalSkillRoots: [root.appendingPathComponent("skills")]
+            )
+        )
+        let assembly = try PromptAssembler.build(configuration: config, userText: "$report-writer summarize")
+        XCTAssertEqual(assembly.activatedSkills.map(\.name), ["report-writer"])
+    }
+
+    func testEmbeddedSkillInstallDoesNotDeleteExistingSkillsWhenValidationFails() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("SwiftCodexCoreTests-\(UUID().uuidString)")
+        let existing = root.appendingPathComponent("existing")
+        try FileManager.default.createDirectory(at: existing, withIntermediateDirectories: true)
+        try "keep".write(to: existing.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let invalid = EmbeddedAgentSkill(
+            name: "invalid",
+            description: "Invalid skill",
+            instructions: "No-op",
+            directoryName: "existing/escape"
+        )
+
+        XCTAssertThrowsError(try EmbeddedSkillInstaller.install([invalid], into: root, overwrite: true))
+        XCTAssertEqual(try String(contentsOf: existing.appendingPathComponent("SKILL.md"), encoding: .utf8), "keep")
+    }
+
     func testEmbeddedSkillInstallerRejectsEscapingFiles() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("SwiftCodexCoreTests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -246,4 +388,66 @@ final class CodexCoreTests: XCTestCase {
         return [Base64URL.encode(header), Base64URL.encode(payloadData), "sig"].joined(separator: ".")
     }
 
+}
+
+private final class RecordingModelProvider: ModelProvider, @unchecked Sendable {
+    private let lock = NSLock()
+    private var batches: [[ModelStreamEvent]]
+    private var storage: [ResponsesRequest] = []
+
+    init(batches: [[ModelStreamEvent]]) {
+        self.batches = batches
+    }
+
+    var requests: [ResponsesRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func streamResponse(_ request: ResponsesRequest) -> AsyncThrowingStream<ModelStreamEvent, Error> {
+        lock.lock()
+        storage.append(request)
+        let events = batches.isEmpty ? [.completed(responseID: nil, usage: nil)] : batches.removeFirst()
+        lock.unlock()
+        return AsyncThrowingStream { continuation in
+            for event in events { continuation.yield(event) }
+            continuation.finish()
+        }
+    }
+}
+
+private final class DelayedModelProvider: ModelProvider, @unchecked Sendable {
+    let delayNanoseconds: UInt64
+
+    init(delayNanoseconds: UInt64) {
+        self.delayNanoseconds = delayNanoseconds
+    }
+
+    func streamResponse(_ request: ResponsesRequest) -> AsyncThrowingStream<ModelStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                try? await Task.sleep(nanoseconds: delayNanoseconds)
+                continuation.yield(.outputTextDelta("done"))
+                continuation.yield(.completed(responseID: "delayed", usage: nil))
+                continuation.finish()
+            }
+        }
+    }
+}
+
+private struct ApprovalEchoTool: AgentTool {
+    let definition = ToolDefinition(
+        name: "approval_echo",
+        description: "Echo text after approval.",
+        parameters: ToolSchemas.object(properties: [
+            "text": ToolSchemas.string(description: "Text to echo")
+        ], required: ["text"]),
+        requiresApproval: true,
+        isStateChanging: true
+    )
+
+    func run(arguments: JSONValue, context: ToolExecutionContext) async throws -> ToolResult {
+        ToolResult(content: try arguments.requiredString("text"))
+    }
 }

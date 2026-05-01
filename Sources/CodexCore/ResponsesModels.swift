@@ -7,6 +7,14 @@ public struct ResponseToolDefinition: Codable, Sendable, Equatable {
     public var name: String? { fields["name"]?.stringValue }
     public var description: String? { fields["description"]?.stringValue }
     public var parameters: JSONValue? { fields["parameters"] }
+    public var requiresNetworkAccess: Bool {
+        switch type {
+        case "web_search", "web_search_preview", "image_generation", "mcp":
+            return true
+        default:
+            return false
+        }
+    }
 
     public init(fields: [String: JSONValue]) {
         self.fields = fields

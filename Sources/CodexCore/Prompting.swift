@@ -325,12 +325,14 @@ public enum SkillRegistry {
             }
         }
         if options.includeUserSkills {
+            roots.append(CodexDefaultLocations.codexSkillsDirectory)
             roots.append(CodexDefaultLocations.userSkillsDirectory)
         }
         if options.includeAdminSkills {
             roots.append(URL(fileURLWithPath: "/etc/codex/skills"))
         }
         if options.includeSystemSkills {
+            roots.append(CodexDefaultLocations.codexSystemSkillsDirectory)
             roots.append(URL(fileURLWithPath: "/usr/share/codex/skills"))
         }
         roots.append(contentsOf: options.additionalSkillRoots)
@@ -338,11 +340,8 @@ public enum SkillRegistry {
         var skills: [AgentSkill] = []
         var seenPaths = Set<String>()
         for root in roots {
-            guard fm.fileExists(atPath: root.path) else { continue }
-            guard let entries = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { continue }
-            for entry in entries {
-                let manifest = entry.appendingPathComponent("SKILL.md")
-                guard fm.fileExists(atPath: manifest.path), !seenPaths.contains(manifest.path) else { continue }
+            for manifest in skillManifests(under: root, fileManager: fm) {
+                guard !seenPaths.contains(manifest.path) else { continue }
                 if let skill = try parseSkill(at: manifest) {
                     skills.append(skill)
                     seenPaths.insert(manifest.path)
@@ -350,6 +349,30 @@ public enum SkillRegistry {
             }
         }
         return skills.sorted { lhs, rhs in lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending }
+    }
+
+    private static func skillManifests(under root: URL, fileManager fm: FileManager) -> [URL] {
+        guard fm.fileExists(atPath: root.path) else { return [] }
+        var queue = [root]
+        var manifests: [URL] = []
+        while !queue.isEmpty {
+            let directory = queue.removeFirst()
+            guard let entries = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { continue }
+            for entry in entries {
+                let name = entry.lastPathComponent
+                let values = try? entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                if values?.isSymbolicLink == true { continue }
+                if values?.isDirectory == true {
+                    if name.hasPrefix("."), entry.standardizedFileURL != root.standardizedFileURL {
+                        continue
+                    }
+                    queue.append(entry)
+                } else if name == "SKILL.md" {
+                    manifests.append(entry)
+                }
+            }
+        }
+        return manifests
     }
 
     public static func parseSkill(at manifest: URL) throws -> AgentSkill? {

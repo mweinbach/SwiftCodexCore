@@ -121,6 +121,7 @@ public final class CodexAgent: Sendable {
         var lastResponseID: String?
         var finalUsage: TokenUsage?
         var status: TurnStatus = .completed
+        var nextInputUsesPreviousResponse = false
 
         for iteration in 0..<configuration.maxToolIterations {
             if await control.isInterrupted() {
@@ -143,21 +144,26 @@ public final class CodexAgent: Sendable {
                 }
                 accumulatedUserText += "\n" + steeringInputs.map(\.text).joined(separator: "\n")
                 promptAssembly = try PromptAssembler.build(configuration: configuration, userText: accumulatedUserText, threadID: threadID, turnID: turnID)
-                responseInputs = try await buildInputItems(threadID: threadID, prefixItems: promptAssembly.inputPrefixItems)
+                if nextInputUsesPreviousResponse {
+                    responseInputs.append(contentsOf: steeringInputs.map { ResponseInputBuilder.userMessage($0.text) })
+                } else {
+                    responseInputs = try await buildInputItems(threadID: threadID, prefixItems: promptAssembly.inputPrefixItems)
+                }
             }
 
             let localToolDefinitions = await toolRegistry.listDefinitions().map(\.responseTool)
-            let toolDefinitions = localToolDefinitions + configuration.serverTools
+            let toolDefinitions = toolsAllowedBySandbox(localToolDefinitions + configuration.serverTools)
             let request = ResponsesRequest(
                 model: configuration.model,
                 instructions: promptAssembly.instructions,
                 input: responseInputs,
                 tools: toolDefinitions,
                 stream: true,
-                previousResponseID: nil,
+                previousResponseID: nextInputUsesPreviousResponse ? lastResponseID : nil,
                 metadata: ["thread_id": .string(threadID), "turn_id": .string(turnID), "iteration": .number(Double(iteration))],
                 parallelToolCalls: true
             )
+            nextInputUsesPreviousResponse = false
 
             var assistantBuffer = ""
             var completedMessage: String?
@@ -229,6 +235,7 @@ public final class CodexAgent: Sendable {
                     try await threadManager.appendItem(item, to: threadID)
                     continuation.yield(.itemCompleted(item))
                 }
+                var toolOutputs: [JSONValue] = []
                 for call in toolCalls {
                     let callItem = ThreadItem(
                         threadID: threadID,
@@ -254,6 +261,9 @@ public final class CodexAgent: Sendable {
                         approvalPolicy: configuration.approvalPolicy,
                         sandboxPolicy: configuration.sandboxPolicy,
                         approvalHandler: approvalHandler,
+                        approvalEventHandler: { request in
+                            continuation.yield(.approvalRequested(request))
+                        },
                         metadata: ["tool_call_id": .string(call.callID)]
                     )
                     let result: ToolResult
@@ -279,8 +289,14 @@ public final class CodexAgent: Sendable {
                     try await threadManager.appendItem(resultItem, to: threadID)
                     continuation.yield(.toolCompleted(call: call, result: result))
                     continuation.yield(.itemCompleted(resultItem))
+                    toolOutputs.append(ResponseInputBuilder.functionCallOutput(callID: call.callID, output: result.content))
                 }
-                responseInputs = try await buildInputItems(threadID: threadID, prefixItems: promptAssembly.inputPrefixItems)
+                if lastResponseID != nil {
+                    responseInputs = toolOutputs
+                    nextInputUsesPreviousResponse = true
+                } else {
+                    responseInputs = try await buildInputItems(threadID: threadID, prefixItems: promptAssembly.inputPrefixItems)
+                }
                 continue
             }
 
@@ -303,6 +319,11 @@ public final class CodexAgent: Sendable {
 
         if status == .running { status = .completed }
         continuation.yield(.turnCompleted(threadID: threadID, turnID: turnID, status: status, usage: finalUsage))
+    }
+
+    private func toolsAllowedBySandbox(_ tools: [ResponseToolDefinition]) -> [ResponseToolDefinition] {
+        guard !configuration.sandboxPolicy.allowNetwork else { return tools }
+        return tools.filter { !$0.requiresNetworkAccess }
     }
 
     private func buildInputItems(threadID: String, prefixItems: [JSONValue] = []) async throws -> [JSONValue] {

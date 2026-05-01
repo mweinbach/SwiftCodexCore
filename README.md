@@ -91,7 +91,7 @@ let thread = try await environment.runtime.createThread(title: "iOS session")
 
 ```swift
 let thread = try await runtime.createThread(title: "Interactive")
-let handle = await runtime.startTurn(
+let handle = try await runtime.startTurn(
     threadID: thread.id,
     input: TurnInput("Find likely bugs in the repo.")
 )

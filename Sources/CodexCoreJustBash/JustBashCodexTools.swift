@@ -21,16 +21,18 @@ public enum JustBashCodexFactory {
         username: String = "coder",
         configuration: AgentConfiguration = AgentConfiguration(),
         embeddedSkills: [EmbeddedAgentSkill] = [],
-        embeddedSkillsRootName: String = ".codex/embedded-skills",
+        embeddedSkillsRootName: String = "bundled",
+        embeddedSkillsRootURL: URL? = nil,
         threadStore: any ThreadStore = JSONFileThreadStore(),
         approvalHandler: ApprovalHandler? = nil
     ) throws -> JustBashCodexEnvironment {
-        let options = try BashOptions.codingAgentWorkspace(rootURL: workspaceRootURL, username: username)
+        var options = try BashOptions.codingAgentWorkspace(rootURL: workspaceRootURL, username: username)
+        options.enableOAIPrimaryRuntime()
         let bash = Bash(options: options)
         var config = configuration
         config.workspaceURL = workspaceRootURL
         if !embeddedSkills.isEmpty {
-            let skillsRoot = workspaceRootURL.appendingPathComponent(embeddedSkillsRootName, isDirectory: true)
+            let skillsRoot = embeddedSkillsRootURL ?? CodexDefaultLocations.embeddedSkillsDirectory.appendingPathComponent(embeddedSkillsRootName, isDirectory: true)
             _ = try config.installEmbeddedSkills(embeddedSkills, rootURL: skillsRoot)
         }
         let runtime = CodexRuntime(
@@ -395,6 +397,7 @@ private enum UnifiedDiffApplier {
 
     private static func apply(file: FilePatch, to text: String) throws -> String {
         var lines = splitLines(text)
+        let hadFinalNewline = text.hasSuffix("\n")
         var offset = 0
         for hunk in file.hunks {
             var cursor = max(hunk.oldStart - 1 + offset, 0)
@@ -418,7 +421,8 @@ private enum UnifiedDiffApplier {
                 }
             }
         }
-        return lines.joined(separator: "\n") + "\n"
+        let patched = lines.joined(separator: "\n")
+        return hadFinalNewline ? patched + "\n" : patched
     }
 
     private static func splitLines(_ text: String) -> [String] {

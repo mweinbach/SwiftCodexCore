@@ -28,6 +28,18 @@ public enum CodexDefaultLocations {
         #endif
     }
 
+    public static var codexSkillsDirectory: URL {
+        codexHome.appendingPathComponent("skills", isDirectory: true)
+    }
+
+    public static var codexSystemSkillsDirectory: URL {
+        codexSkillsDirectory.appendingPathComponent(".system", isDirectory: true)
+    }
+
+    public static var embeddedSkillsDirectory: URL {
+        codexHome.appendingPathComponent("embedded-skills", isDirectory: true)
+    }
+
     private static var applicationSupportDirectory: URL {
         if let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
             return url

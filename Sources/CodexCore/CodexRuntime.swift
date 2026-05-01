@@ -91,6 +91,9 @@ public actor CodexRuntime {
     }
 
     public func connectMCP(_ client: any MCPClient, initialize: Bool = true) async throws {
+        guard !client.requiresNetworkAccess || configuration.sandboxPolicy.allowNetwork else {
+            throw CodexCoreError.approvalRequired("MCP client \(client.name) requires network access, but network is disabled by the sandbox policy")
+        }
         try await mcpRegistry.addClient(client, initialize: initialize)
         await mcpRegistry.registerAdapters(into: toolRegistry)
     }
@@ -100,38 +103,40 @@ public actor CodexRuntime {
         await mcpRegistry.registerAdapters(into: toolRegistry)
     }
 
-    public func startTurn(threadID: String, input: TurnInput) -> TurnHandle {
+    public func startTurn(threadID: String, input: TurnInput) throws -> TurnHandle {
+        if let active = activeTurnsByThreadID[threadID] {
+            throw CodexCoreError.invalidState("Thread \(threadID) already has active turn \(active.turnID)")
+        }
         let agent = makeAgent(configuration: configuration)
         let rawHandle = agent.startTurn(threadID: threadID, input: input)
-        let events = AsyncThrowingStream<AgentEvent, Error> { continuation in
-            let task = Task {
-                do {
-                    for try await event in rawHandle.events {
-                        continuation.yield(event)
-                        if case .turnCompleted(_, let turnID, _, _) = event {
-                            self.clearActiveTurn(threadID: threadID, turnID: turnID)
-                        }
+        let stream = AsyncThrowingStream<AgentEvent, Error>.makeStream()
+        let handle = TurnHandle(threadID: rawHandle.threadID, turnID: rawHandle.turnID, events: stream.stream, control: rawHandle.control)
+        activeTurnsByThreadID[threadID] = handle
+        let task = Task {
+            do {
+                for try await event in rawHandle.events {
+                    stream.continuation.yield(event)
+                    if case .turnCompleted(_, let turnID, _, _) = event {
+                        self.clearActiveTurn(threadID: threadID, turnID: turnID)
                     }
-                    self.clearActiveTurn(threadID: threadID, turnID: rawHandle.turnID)
-                    continuation.finish()
-                } catch {
-                    self.clearActiveTurn(threadID: threadID, turnID: rawHandle.turnID)
-                    continuation.finish(throwing: error)
                 }
-            }
-            continuation.onTermination = { @Sendable _ in
-                task.cancel()
-                Task { await self.clearActiveTurn(threadID: threadID, turnID: rawHandle.turnID) }
+                self.clearActiveTurn(threadID: threadID, turnID: rawHandle.turnID)
+                stream.continuation.finish()
+            } catch {
+                self.clearActiveTurn(threadID: threadID, turnID: rawHandle.turnID)
+                stream.continuation.finish(throwing: error)
             }
         }
-        let handle = TurnHandle(threadID: rawHandle.threadID, turnID: rawHandle.turnID, events: events, control: rawHandle.control)
-        activeTurnsByThreadID[threadID] = handle
+        stream.continuation.onTermination = { @Sendable _ in
+            task.cancel()
+            Task { await self.clearActiveTurn(threadID: threadID, turnID: rawHandle.turnID) }
+        }
         return handle
     }
 
     @discardableResult
     public func sendMessage(threadID: String, text: String, metadata: [String: JSONValue] = [:]) async throws -> String {
-        let handle = startTurn(threadID: threadID, input: TurnInput(text, metadata: metadata))
+        let handle = try startTurn(threadID: threadID, input: TurnInput(text, metadata: metadata))
         var final = ""
         for try await event in handle.events {
             if case .itemCompleted(let item) = event, item.kind == .assistantMessage {

@@ -60,44 +60,42 @@ public enum EmbeddedSkillInstaller {
         overwrite: Bool = true
     ) throws -> [InstalledEmbeddedSkill] {
         let fm = FileManager.default
-        try fm.createDirectory(at: rootURL, withIntermediateDirectories: true)
-        var installed: [InstalledEmbeddedSkill] = []
-        var usedDirectories = Set<String>()
+        let plan = try installationPlan(for: skills, rootURL: rootURL)
 
-        for skill in skills {
-            let directoryName = skill.directoryName ?? sanitizedDirectoryName(for: skill.name)
-            guard isSafeDirectoryName(directoryName) else {
-                throw CodexCoreError.invalidInput("Embedded skill \(skill.name) has an invalid directory name: \(directoryName)")
+        if overwrite {
+            let parent = rootURL.deletingLastPathComponent()
+            try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+            let temporaryRoot = parent.appendingPathComponent(".\(rootURL.lastPathComponent).staging-\(UUID().uuidString)", isDirectory: true)
+            do {
+                try write(plan, under: temporaryRoot)
+                if fm.fileExists(atPath: rootURL.path) {
+                    _ = try fm.replaceItemAt(rootURL, withItemAt: temporaryRoot)
+                } else {
+                    try fm.moveItem(at: temporaryRoot, to: rootURL)
+                }
+            } catch {
+                try? fm.removeItem(at: temporaryRoot)
+                throw error
             }
-            guard usedDirectories.insert(directoryName).inserted else {
-                throw CodexCoreError.invalidInput("Duplicate embedded skill directory: \(directoryName)")
+        } else {
+            try fm.createDirectory(at: rootURL, withIntermediateDirectories: true)
+            for item in plan {
+                let directoryURL = rootURL.appendingPathComponent(item.directoryName, isDirectory: true)
+                if fm.fileExists(atPath: directoryURL.path) {
+                    throw CodexCoreError.invalidState("Embedded skill directory already exists: \(directoryURL.path)")
+                }
             }
-
-            let directoryURL = rootURL.appendingPathComponent(directoryName, isDirectory: true)
-            if overwrite, fm.fileExists(atPath: directoryURL.path) {
-                try fm.removeItem(at: directoryURL)
-            }
-            try fm.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-
-            let manifestURL = directoryURL.appendingPathComponent("SKILL.md")
-            try skill.manifestText.write(to: manifestURL, atomically: true, encoding: .utf8)
-
-            if !skill.allowImplicitInvocation {
-                let configURL = directoryURL.appendingPathComponent("agents/openai.yaml")
-                try fm.createDirectory(at: configURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try "allow_implicit_invocation: false\n".write(to: configURL, atomically: true, encoding: .utf8)
-            }
-
-            for file in skill.files {
-                let destination = try destinationURL(for: file.relativePath, under: directoryURL)
-                try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try file.contents.write(to: destination, atomically: true, encoding: .utf8)
-            }
-
-            installed.append(InstalledEmbeddedSkill(skill: skill, directoryURL: directoryURL, manifestURL: manifestURL))
+            try write(plan, under: rootURL)
         }
 
-        return installed
+        return plan.map { item in
+            let directoryURL = rootURL.appendingPathComponent(item.directoryName, isDirectory: true)
+            return InstalledEmbeddedSkill(
+                skill: item.skill,
+                directoryURL: directoryURL,
+                manifestURL: directoryURL.appendingPathComponent("SKILL.md")
+            )
+        }
     }
 
     public static func sanitizedDirectoryName(for skillName: String) -> String {
@@ -119,6 +117,55 @@ public enum EmbeddedSkillInstaller {
             && directoryName != ".."
             && !directoryName.contains("/")
             && !directoryName.contains("\\")
+    }
+
+    private struct PlannedSkill {
+        var skill: EmbeddedAgentSkill
+        var directoryName: String
+    }
+
+    private static func installationPlan(for skills: [EmbeddedAgentSkill], rootURL: URL) throws -> [PlannedSkill] {
+        var usedDirectories = Set<String>()
+        var plan: [PlannedSkill] = []
+        for skill in skills {
+            let directoryName = skill.directoryName ?? sanitizedDirectoryName(for: skill.name)
+            guard isSafeDirectoryName(directoryName) else {
+                throw CodexCoreError.invalidInput("Embedded skill \(skill.name) has an invalid directory name: \(directoryName)")
+            }
+            guard usedDirectories.insert(directoryName).inserted else {
+                throw CodexCoreError.invalidInput("Duplicate embedded skill directory: \(directoryName)")
+            }
+            let directoryURL = rootURL.appendingPathComponent(directoryName, isDirectory: true)
+            for file in skill.files {
+                _ = try destinationURL(for: file.relativePath, under: directoryURL)
+            }
+            plan.append(PlannedSkill(skill: skill, directoryName: directoryName))
+        }
+        return plan
+    }
+
+    private static func write(_ plan: [PlannedSkill], under rootURL: URL) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        for item in plan {
+            let directoryURL = rootURL.appendingPathComponent(item.directoryName, isDirectory: true)
+            try fm.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+
+            let manifestURL = directoryURL.appendingPathComponent("SKILL.md")
+            try item.skill.manifestText.write(to: manifestURL, atomically: true, encoding: .utf8)
+
+            if !item.skill.allowImplicitInvocation {
+                let configURL = directoryURL.appendingPathComponent("agents/openai.yaml")
+                try fm.createDirectory(at: configURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try "allow_implicit_invocation: false\n".write(to: configURL, atomically: true, encoding: .utf8)
+            }
+
+            for file in item.skill.files {
+                let destination = try destinationURL(for: file.relativePath, under: directoryURL)
+                try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try file.contents.write(to: destination, atomically: true, encoding: .utf8)
+            }
+        }
     }
 
     private static func destinationURL(for relativePath: String, under rootURL: URL) throws -> URL {
