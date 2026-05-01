@@ -4,8 +4,10 @@ A SwiftPM package that implements a Codex-style agent core in Swift:
 
 - Responses-compatible model transport
 - core turn loop: sample → tool call → tool result → resample → final answer
-- tool registry and built-in file/shell/edit/patch tools
-- MCP client support for stdio and Streamable HTTP servers
+- tool registry plus built-in portable file/edit tools
+- macOS desktop shell/patch/MCP stdio tools
+- optional JustBash-backed shell/file/edit/patch tools for iOS hosts
+- MCP client support for Streamable HTTP servers, plus stdio on macOS
 - thread storage, thread manager, fork, rollback, archive, and resume primitives
 - steering and interruption of active turns
 - subagent graph and `spawn_subagent` tool
@@ -18,14 +20,14 @@ This is intentionally a core package, not a terminal UI. Use it under a CLI, des
 
 ## Status
 
-The package builds and tests on Swift 6.2/Linux. It has no external dependencies.
+The package builds and tests with Swift 6.2. `CodexCore` supports macOS and iOS; desktop-only `Process` integrations are macOS-gated. `CodexCoreJustBash` links the sibling `../just-bash-swift` package and provides the on-device tool implementation for iOS hosts.
 
 ```bash
 swift test
 swift run codex-core-example
 ```
 
-The implementation is production-shaped but not production-hardened. In particular, the local file/shell sandbox is policy enforcement, not an OS-level sandbox; ChatGPT OAuth mirrors the public Codex OAuth/cache/device-code shape but still depends on the live OpenAI auth service accepting the public client flow; and HTTP Responses streaming is parsed through a buffered Foundation request for Linux compatibility.
+The implementation is production-shaped but not production-hardened. In particular, the local file/shell sandbox is policy enforcement, not an OS-level sandbox; ChatGPT OAuth mirrors the public Codex OAuth/cache/device-code shape but still depends on the live OpenAI auth service accepting the public client flow; and the Responses client streams SSE incrementally through `URLSession.bytes`.
 
 ## Quick start with API-key auth
 
@@ -59,6 +61,30 @@ let answer = try await runtime.sendMessage(
     text: "Inspect this project and summarize the architecture."
 )
 print(answer)
+```
+
+## iOS tool host with JustBash
+
+On iOS, keep `CodexCore` portable and supply tools from `CodexCoreJustBash`:
+
+```swift
+import CodexCore
+import CodexCoreJustBash
+import JustBash
+
+let workspace = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+let environment = try JustBashCodexFactory.makeEnvironment(
+    modelProvider: model,
+    workspaceRootURL: workspace,
+    configuration: AgentConfiguration(
+        model: "gpt-5.4",
+        instructions: "You are a careful coding agent running on iOS.",
+        approvalPolicy: .onRequest,
+        sandboxPolicy: .workspaceWrite
+    )
+)
+
+let thread = try await environment.runtime.createThread(title: "iOS session")
 ```
 
 ## Streaming a turn and steering it
@@ -221,8 +247,10 @@ let runtime = CodexRuntime(modelProvider: model, threadStore: store)
 - `write_file`
 - `list_files`
 - `edit_file`
-- `apply_patch`
-- `shell`
+- `apply_patch` on macOS
+- `shell` on macOS when `includeShell` is true
+
+For iOS hosts, use `justBashCodexTools(bash:)` from `CodexCoreJustBash`; it provides the same shell/file/edit/patch surface through the embedded JustBash runtime instead of system processes.
 
 The tools are ordinary Swift types conforming to `AgentTool`, so app-specific tools can be added without changing the agent loop.
 
@@ -250,18 +278,22 @@ await runtime.registerTool(MyTool())
 Sources/CodexCore
   AgentLoop.swift              Core sample/tool/resample loop
   CodexRuntime.swift           High-level app/server facade
+  CodexDefaultLocations.swift  Platform-safe default storage locations
   ResponsesModels.swift        Responses request + canonical stream events
   OpenAIResponsesClient.swift  HTTP Responses-compatible transport
   Prompting.swift              Default prompt, AGENTS.md loader, skill discovery/injection
   Tools.swift                  Tool protocol, registry, schemas
-  BuiltinTools.swift           File/shell/edit/patch tools
-  MCP.swift                    JSON-RPC, stdio MCP, Streamable HTTP MCP
+  BuiltinTools.swift           Portable file tools plus macOS shell/patch tools
+  MCP.swift                    JSON-RPC, Streamable HTTP MCP, macOS stdio MCP
   Auth.swift                   API-key, Codex ChatGPT OAuth/cache/refresh, OAuth helper
   ThreadStorage.swift          In-memory and JSON file thread stores
   Subagents.swift              Agent graph, manager, spawn_subagent tool
   CoreModels.swift             Threads, items, turns, config
   AgentEvent.swift             UI/app-server-friendly event stream
   JSONValue.swift              Arbitrary JSON bridge
+
+Sources/CodexCoreJustBash
+  JustBashCodexTools.swift     JustBash-backed CodexRuntime factory and tools
 ```
 
 ## Design rule
