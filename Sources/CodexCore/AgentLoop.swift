@@ -27,7 +27,7 @@ public final class TurnHandle: Sendable {
     public let threadID: String
     public let turnID: String
     public let events: AsyncThrowingStream<AgentEvent, Error>
-    private let control: TurnControl
+    let control: TurnControl
 
     public init(threadID: String, turnID: String, events: AsyncThrowingStream<AgentEvent, Error>, control: TurnControl) {
         self.threadID = threadID

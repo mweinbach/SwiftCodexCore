@@ -117,6 +117,7 @@ public struct EditFileTool: AgentTool {
     }
 }
 
+#if os(macOS)
 public struct ShellTool: AgentTool {
     public let definition = ToolDefinition(
         name: "shell",
@@ -175,6 +176,7 @@ public struct ApplyPatchTool: AgentTool {
         return ToolResult(content: output.isEmpty ? "patch exited with status \(result.exitCode)" : output, isError: result.exitCode != 0)
     }
 }
+#endif
 
 public func defaultBuiltinTools(includeShell: Bool = true) -> [any AgentTool] {
     var tools: [any AgentTool] = [
@@ -182,23 +184,34 @@ public func defaultBuiltinTools(includeShell: Bool = true) -> [any AgentTool] {
         FileReadTool(),
         FileWriteTool(),
         ListFilesTool(),
-        EditFileTool(),
-        ApplyPatchTool()
+        EditFileTool()
     ]
+    #if os(macOS)
+    tools.append(ApplyPatchTool())
     if includeShell { tools.append(ShellTool()) }
+    #endif
     return tools
 }
 
 func resolvePath(_ path: String, context: ToolExecutionContext, forWrite: Bool) throws -> URL {
     let base = context.workspaceURL ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     let raw = URL(fileURLWithPath: path, relativeTo: path.hasPrefix("/") ? nil : base).standardizedFileURL
-    if forWrite {
-        let allowedRoots = context.sandboxPolicy.writableRoots.isEmpty ? [base] : context.sandboxPolicy.writableRoots
-        guard allowedRoots.contains(where: { raw.path == $0.standardizedFileURL.path || raw.path.hasPrefix($0.standardizedFileURL.path + "/") }) else {
-            throw CodexCoreError.approvalRequired("Path is outside writable roots: \(raw.path)")
-        }
+    let allowedRoots = forWrite
+        ? (context.sandboxPolicy.writableRoots.isEmpty ? [base] : context.sandboxPolicy.writableRoots)
+        : [base]
+    guard allowedRoots.contains(where: { raw.isContained(in: $0) }) else {
+        let operation = forWrite ? "writable" : "readable"
+        throw CodexCoreError.approvalRequired("Path is outside \(operation) roots: \(raw.path)")
     }
     return raw
+}
+
+private extension URL {
+    func isContained(in root: URL) -> Bool {
+        let path = standardizedFileURL.resolvingSymlinksInPath().path
+        let rootPath = root.standardizedFileURL.resolvingSymlinksInPath().path
+        return path == rootPath || path.hasPrefix(rootPath + "/")
+    }
 }
 
 func relativePath(_ child: URL, base: URL) -> String {
@@ -209,6 +222,7 @@ func relativePath(_ child: URL, base: URL) -> String {
     return childPath
 }
 
+#if os(macOS)
 public struct ProcessResult: Sendable, Equatable {
     public var exitCode: Int32
     public var stdout: String
@@ -257,3 +271,4 @@ public enum ProcessRunner {
         }
     }
 }
+#endif

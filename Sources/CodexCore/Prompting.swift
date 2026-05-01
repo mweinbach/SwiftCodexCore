@@ -239,7 +239,7 @@ public enum ProjectInstructionLoader {
     public static func load(options: ProjectInstructionOptions, workspaceURL: URL?) throws -> [LoadedProjectInstruction] {
         guard options.enabled else { return [] }
         let fm = FileManager.default
-        let codexHome = options.codexHome ?? ProcessInfo.processInfo.environment["CODEX_HOME"].flatMap(URL.init(fileURLWithPath:)) ?? fm.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+        let codexHome = options.codexHome ?? CodexDefaultLocations.codexHome
         let cwd = options.currentWorkingDirectory ?? workspaceURL ?? URL(fileURLWithPath: fm.currentDirectoryPath)
         var files: [URL] = []
 
@@ -323,7 +323,7 @@ public enum SkillRegistry {
             }
         }
         if options.includeUserSkills {
-            roots.append(fm.homeDirectoryForCurrentUser.appendingPathComponent(".agents/skills"))
+            roots.append(CodexDefaultLocations.userSkillsDirectory)
         }
         if options.includeAdminSkills {
             roots.append(URL(fileURLWithPath: "/etc/codex/skills"))

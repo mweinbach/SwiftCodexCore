@@ -24,6 +24,34 @@ final class CodexCoreTests: XCTestCase {
         XCTAssertEqual(result.content, "hello")
     }
 
+    func testFileReadCannotEscapeWorkspace() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("SwiftCodexCoreTests-\(UUID().uuidString)")
+        let workspace = root.appendingPathComponent("workspace")
+        let outside = root.appendingPathComponent("outside.txt")
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        try "secret".write(to: outside, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let registry = ToolRegistry(tools: [FileReadTool()])
+        let context = ToolExecutionContext(
+            threadID: "t",
+            turnID: "u",
+            workspaceURL: workspace,
+            approvalPolicy: .never,
+            sandboxPolicy: .workspaceWrite
+        )
+        do {
+            _ = try await registry.run(
+                name: "read_file",
+                arguments: .object(["path": .string("../outside.txt")]),
+                context: context
+            )
+            XCTFail("Expected read outside workspace to fail")
+        } catch CodexCoreError.approvalRequired(let message) {
+            XCTAssertTrue(message.contains("outside readable roots"))
+        }
+    }
+
     func testAgentLoopRunsToolThenFinalAnswer() async throws {
         let provider = ScriptedModelProvider(batches: [
             [
@@ -52,6 +80,23 @@ final class CodexCoreTests: XCTestCase {
         }
         XCTAssertTrue(sawTool)
         XCTAssertTrue(sawFinal)
+    }
+
+    func testRuntimeClearsActiveTurnWhenStreamingHandleCompletes() async throws {
+        let provider = ScriptedModelProvider(batches: [
+            [
+                .outputTextDelta("done"),
+                .completed(responseID: "r1", usage: nil)
+            ]
+        ])
+        let runtime = CodexRuntime(modelProvider: provider, tools: [])
+        let thread = try await runtime.createThread()
+        let handle = await runtime.startTurn(threadID: thread.id, input: TurnInput("go"))
+
+        for try await _ in handle.events {}
+
+        let active = await runtime.activeTurn(threadID: thread.id)
+        XCTAssertNil(active)
     }
 
     func testThreadForkRollback() async throws {

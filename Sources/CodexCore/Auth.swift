@@ -70,7 +70,7 @@ public struct APIKeyAuthProvider: AuthorizationProvider {
 public actor FileAuthStore {
     public let fileURL: URL
 
-    public init(fileURL: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".swift-codex-core/auth.json")) {
+    public init(fileURL: URL = CodexDefaultLocations.coreDirectory.appendingPathComponent("auth.json")) {
         self.fileURL = fileURL
     }
 
@@ -205,10 +205,7 @@ public actor CodexAuthStore {
     }
 
     public static func defaultCodexHome() -> URL {
-        if let value = ProcessInfo.processInfo.environment["CODEX_HOME"], !value.isEmpty {
-            return URL(fileURLWithPath: value)
-        }
-        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+        CodexDefaultLocations.codexHome
     }
 
     public func load() throws -> CodexAuthDotJson? {

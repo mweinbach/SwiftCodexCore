@@ -34,7 +34,7 @@ public actor InMemoryThreadStore: ThreadStore {
 public actor JSONFileThreadStore: ThreadStore {
     public let directoryURL: URL
 
-    public init(directoryURL: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".swift-codex-core/threads")) {
+    public init(directoryURL: URL = CodexDefaultLocations.coreDirectory.appendingPathComponent("threads", isDirectory: true)) {
         self.directoryURL = directoryURL
     }
 

@@ -102,7 +102,29 @@ public actor CodexRuntime {
 
     public func startTurn(threadID: String, input: TurnInput) -> TurnHandle {
         let agent = makeAgent(configuration: configuration)
-        let handle = agent.startTurn(threadID: threadID, input: input)
+        let rawHandle = agent.startTurn(threadID: threadID, input: input)
+        let events = AsyncThrowingStream<AgentEvent, Error> { continuation in
+            let task = Task {
+                do {
+                    for try await event in rawHandle.events {
+                        continuation.yield(event)
+                        if case .turnCompleted(_, let turnID, _, _) = event {
+                            self.clearActiveTurn(threadID: threadID, turnID: turnID)
+                        }
+                    }
+                    self.clearActiveTurn(threadID: threadID, turnID: rawHandle.turnID)
+                    continuation.finish()
+                } catch {
+                    self.clearActiveTurn(threadID: threadID, turnID: rawHandle.turnID)
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
+                Task { await self.clearActiveTurn(threadID: threadID, turnID: rawHandle.turnID) }
+            }
+        }
+        let handle = TurnHandle(threadID: rawHandle.threadID, turnID: rawHandle.turnID, events: events, control: rawHandle.control)
         activeTurnsByThreadID[threadID] = handle
         return handle
     }
@@ -114,9 +136,6 @@ public actor CodexRuntime {
         for try await event in handle.events {
             if case .itemCompleted(let item) = event, item.kind == .assistantMessage {
                 final = item.payload["content"]?.stringValue ?? item.summary ?? final
-            }
-            if case .turnCompleted = event {
-                activeTurnsByThreadID.removeValue(forKey: threadID)
             }
         }
         return final
@@ -145,6 +164,11 @@ public actor CodexRuntime {
 
     public func activeTurn(threadID: String) -> TurnHandle? {
         activeTurnsByThreadID[threadID]
+    }
+
+    private func clearActiveTurn(threadID: String, turnID: String) {
+        guard activeTurnsByThreadID[threadID]?.turnID == turnID else { return }
+        activeTurnsByThreadID.removeValue(forKey: threadID)
     }
 
     public func installSubagentTool(maxDepth _: Int = 4) async {

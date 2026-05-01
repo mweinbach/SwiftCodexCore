@@ -36,18 +36,18 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         self.session = session
     }
 
-    /// Sends a Responses request and yields canonical model events.
-    /// On platforms where FoundationNetworking does not expose URLSession.AsyncBytes, this buffers the HTTP body first
-    /// and then replays parsed stream events through AsyncThrowingStream.
+    /// Sends a Responses request and yields canonical model events as bytes arrive.
     public func streamResponse(_ request: ResponsesRequest) -> AsyncThrowingStream<ModelStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let (data, http) = try await send(request, allowRefresh: true)
+                    let (bytes, http) = try await send(request, allowRefresh: true)
                     let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? ""
-                    if contentType.contains("text/event-stream") || (String(data: data, encoding: .utf8)?.contains("data:") == true) {
-                        try Self.parseSSE(data: data, continuation: continuation)
+                    if contentType.contains("text/event-stream") {
+                        try await Self.parseSSE(bytes: bytes, continuation: continuation)
                     } else {
+                        var data = Data()
+                        for try await byte in bytes { data.append(byte) }
                         try Self.parseJSONResponse(data: data, continuation: continuation)
                     }
                     continuation.finish()
@@ -59,8 +59,24 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         }
     }
 
+    private func send(_ request: ResponsesRequest, allowRefresh: Bool) async throws -> (URLSession.AsyncBytes, HTTPURLResponse) {
+        let (bytes, response) = try await session.bytes(for: try makeURLRequest(request))
+        guard let http = response as? HTTPURLResponse else {
+            throw CodexCoreError.transportError("Responses API did not return an HTTP response")
+        }
+        if http.statusCode == 401, allowRefresh, let refreshing = auth as? any TokenRefreshingAuthorizationProvider {
+            _ = try await collectBody(bytes)
+            try await refreshing.refreshNow()
+            return try await send(request, allowRefresh: false)
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let data = try await collectBody(bytes)
+            throw CodexCoreError.transportError("Responses API HTTP \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "")")
+        }
+        return (bytes, http)
+    }
 
-    private func send(_ request: ResponsesRequest, allowRefresh: Bool) async throws -> (Data, HTTPURLResponse) {
+    private func makeURLRequest(_ request: ResponsesRequest) async throws -> URLRequest {
         var urlRequest = URLRequest(url: options.endpoint, timeoutInterval: options.requestTimeout)
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -68,46 +84,70 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         for (key, value) in try await auth.authorizationHeaders() { urlRequest.setValue(value, forHTTPHeaderField: key) }
         for (key, value) in options.extraHeaders { urlRequest.setValue(value, forHTTPHeaderField: key) }
         urlRequest.httpBody = try JSONEncoder.codexCompact.encode(request)
+        return urlRequest
+    }
 
-        let (data, response) = try await session.data(for: urlRequest)
-        guard let http = response as? HTTPURLResponse else {
-            throw CodexCoreError.transportError("Responses API did not return an HTTP response")
+    private func collectBody(_ bytes: URLSession.AsyncBytes) async throws -> Data {
+        var data = Data()
+        for try await byte in bytes { data.append(byte) }
+        return data
+    }
+
+    private struct SSEParserState {
+        var eventName: String?
+        var dataLines: [String] = []
+    }
+
+    private static func parseSSE(bytes: URLSession.AsyncBytes, continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation) async throws {
+        var line = Data()
+        var state = SSEParserState()
+        for try await byte in bytes {
+            if byte == 0x0A {
+                if line.last == 0x0D { line.removeLast() }
+                guard let text = String(data: line, encoding: .utf8) else {
+                    throw CodexCoreError.invalidJSON("SSE response line was not UTF-8")
+                }
+                try processSSELine(text, continuation: continuation, state: &state)
+                line.removeAll(keepingCapacity: true)
+            } else {
+                line.append(byte)
+            }
         }
-        if http.statusCode == 401, allowRefresh, let refreshing = auth as? any TokenRefreshingAuthorizationProvider {
-            try await refreshing.refreshNow()
-            return try await send(request, allowRefresh: false)
+        if !line.isEmpty {
+            if line.last == 0x0D { line.removeLast() }
+            guard let text = String(data: line, encoding: .utf8) else {
+                throw CodexCoreError.invalidJSON("SSE response line was not UTF-8")
+            }
+            try processSSELine(text, continuation: continuation, state: &state)
         }
-        guard (200..<300).contains(http.statusCode) else {
-            throw CodexCoreError.transportError("Responses API HTTP \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "")")
-        }
-        return (data, http)
+        try processSSELine("", continuation: continuation, state: &state)
     }
 
     private static func parseSSE(data: Data, continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation) throws {
         guard let text = String(data: data, encoding: .utf8) else { throw CodexCoreError.invalidJSON("SSE response was not UTF-8") }
-        var eventName: String?
-        var dataLines: [String] = []
-
-        func flush() throws {
-            guard !dataLines.isEmpty else { return }
-            let payload = dataLines.joined(separator: "\n")
-            dataLines.removeAll(keepingCapacity: true)
-            if payload == "[DONE]" { return }
-            try emitEvent(named: eventName, dataString: payload, continuation: continuation)
-            eventName = nil
-        }
-
+        var state = SSEParserState()
         for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = rawLine.trimmingCharacters(in: .newlines)
-            if line.isEmpty {
-                try flush()
-            } else if line.hasPrefix("event:") {
-                eventName = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
-            } else if line.hasPrefix("data:") {
-                dataLines.append(String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces))
-            }
+            try processSSELine(String(rawLine), continuation: continuation, state: &state)
         }
-        try flush()
+        try processSSELine("", continuation: continuation, state: &state)
+    }
+
+    private static func processSSELine(_ rawLine: String, continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation, state: inout SSEParserState) throws {
+        let line = rawLine.trimmingCharacters(in: .newlines)
+        if line.isEmpty {
+            guard !state.dataLines.isEmpty else { return }
+            let payload = state.dataLines.joined(separator: "\n")
+            state.dataLines.removeAll(keepingCapacity: true)
+            defer { state.eventName = nil }
+            if payload == "[DONE]" { return }
+            try emitEvent(named: state.eventName, dataString: payload, continuation: continuation)
+        } else if line.hasPrefix(":") {
+            return
+        } else if line.hasPrefix("event:") {
+            state.eventName = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+        } else if line.hasPrefix("data:") {
+            state.dataLines.append(String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces))
+        }
     }
 
     private static func parseJSONResponse(data: Data, continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation) throws {

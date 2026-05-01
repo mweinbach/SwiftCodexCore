@@ -77,6 +77,7 @@ public extension MCPClient {
 }
 
 /// Minimal stdio MCP client. Requests are serialized by actor isolation and read one newline-delimited JSON-RPC response at a time.
+#if os(macOS)
 public actor StdioMCPClient: MCPClient {
     public let name: String
     private let command: String
@@ -211,6 +212,7 @@ public actor StdioMCPClient: MCPClient {
         return try JSONDecoder.codex.decode(JSONRPCResponse.self, from: data)
     }
 }
+#endif
 
 public final class StreamableHTTPMCPClient: MCPClient, Sendable {
     public let name: String
