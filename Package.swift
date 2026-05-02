@@ -13,7 +13,7 @@ let package = Package(
         .executable(name: "codex-core-example", targets: ["CodexCoreExample"])
     ],
     dependencies: [
-        .package(name: "JustBash", path: "../just-bash-swift")
+        .package(url: "https://github.com/mweinbach/just-bash-swift", branch: "main")
     ],
     targets: [
         .target(
@@ -23,7 +23,7 @@ let package = Package(
             name: "CodexCoreJustBash",
             dependencies: [
                 "CodexCore",
-                .product(name: "JustBash", package: "JustBash")
+                .product(name: "JustBash", package: "just-bash-swift")
             ]
         ),
         .executableTarget(
