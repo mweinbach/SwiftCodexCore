@@ -116,7 +116,7 @@ final class CodexCoreTests: XCTestCase {
         for try await _ in handle.events {}
     }
 
-    func testAgentLoopAddsReasoningAndStoredResponseConfig() async throws {
+    func testAgentLoopAddsReasoningAndDisablesForegroundStore() async throws {
         let provider = RecordingModelProvider(batches: [
             [
                 .outputTextDelta("done"),
@@ -138,7 +138,7 @@ final class CodexCoreTests: XCTestCase {
         let request = try XCTUnwrap(provider.requests.first)
         XCTAssertEqual(request.reasoning?.effort, "high")
         XCTAssertEqual(request.reasoning?.summary, "auto")
-        XCTAssertEqual(request.store, true)
+        XCTAssertEqual(request.store, false)
     }
 
     func testNetworkServerToolsAreFilteredWhenSandboxDisallowsNetwork() async throws {

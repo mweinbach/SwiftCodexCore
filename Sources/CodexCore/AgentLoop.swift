@@ -160,7 +160,7 @@ public final class CodexAgent: Sendable {
                 tools: toolDefinitions,
                 stream: true,
                 reasoning: ResponseReasoning(effort: configuration.reasoningEffort, summary: configuration.reasoningSummary),
-                store: configuration.backgroundAccessEnabled ? true : nil,
+                store: false,
                 previousResponseID: nextInputUsesPreviousResponse ? lastResponseID : nil,
                 metadata: ["thread_id": .string(threadID), "turn_id": .string(turnID), "iteration": .number(Double(iteration))],
                 parallelToolCalls: true
