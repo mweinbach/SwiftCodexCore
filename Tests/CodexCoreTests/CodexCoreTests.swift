@@ -216,6 +216,85 @@ final class CodexCoreTests: XCTestCase {
         XCTAssertTrue(json.contains("\"external_web_access\":true"))
     }
 
+    func testResponsesRequestEncodesBackgroundAndStoreFlags() throws {
+        let request = ResponsesRequest(
+            model: "gpt-5.4",
+            input: [ResponseInputBuilder.userMessage("work on this later")],
+            stream: false,
+            background: true,
+            store: true
+        )
+
+        let json = try JSONDecoder.codex.decode(JSONValue.self, from: JSONEncoder.codexCompact.encode(request))
+        XCTAssertEqual(json["background"]?.boolValue, true)
+        XCTAssertEqual(json["store"]?.boolValue, true)
+        XCTAssertEqual(json["stream"]?.boolValue, false)
+    }
+
+    func testOpenAIResponsesClientBackgroundLifecycleUsesResponseEndpoints() async throws {
+        let endpoint = URL(string: "https://example.test/v1/responses")!
+        let requests = Locked<[CapturedHTTPRequest]>([])
+        StubURLProtocol.handler = { request in
+            requests.withValue { $0.append(CapturedHTTPRequest(request)) }
+            let path = request.url?.path ?? ""
+            let method = request.httpMethod ?? ""
+
+            switch (method, path) {
+            case ("POST", "/v1/responses"):
+                let body = try JSONDecoder.codex.decode(JSONValue.self, from: request.bodyData())
+                XCTAssertEqual(body["background"]?.boolValue, true)
+                XCTAssertEqual(body["stream"]?.boolValue, false)
+                XCTAssertEqual(body["store"]?.boolValue, true)
+                return StubURLProtocol.response(
+                    for: request,
+                    json: #"{"id":"resp_123","status":"queued","background":true}"#
+                )
+            case ("GET", "/v1/responses/resp_123"):
+                return StubURLProtocol.response(
+                    for: request,
+                    json: #"{"id":"resp_123","status":"completed","background":true,"output_text":"done","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}"#
+                )
+            case ("POST", "/v1/responses/resp_123/cancel"):
+                return StubURLProtocol.response(
+                    for: request,
+                    json: #"{"id":"resp_123","status":"cancelled","background":true}"#
+                )
+            default:
+                XCTFail("Unexpected request: \(method) \(path)")
+                return StubURLProtocol.response(for: request, statusCode: 404, json: #"{"error":{"message":"not found"}}"#)
+            }
+        }
+        defer { StubURLProtocol.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let client = OpenAIResponsesClient(
+            auth: StaticAuthProvider(),
+            options: OpenAIResponsesClient.Options(endpoint: endpoint),
+            session: session
+        )
+        let request = ResponsesRequest(model: "gpt-5.4", input: [ResponseInputBuilder.userMessage("slow work")])
+
+        let created = try await client.createBackgroundResponse(request)
+        XCTAssertEqual(created.id, "resp_123")
+        XCTAssertEqual(created.status, "queued")
+        XCTAssertFalse(created.isTerminal)
+
+        let retrieved = try await client.retrieveResponse(id: "resp_123")
+        XCTAssertEqual(retrieved.outputText, "done")
+        XCTAssertEqual(retrieved.usage?.totalTokens, 3)
+        XCTAssertTrue(retrieved.isTerminal)
+
+        let cancelled = try await client.cancelResponse(id: "resp_123")
+        XCTAssertEqual(cancelled.status, "cancelled")
+        XCTAssertTrue(cancelled.isTerminal)
+
+        let captured = requests.value
+        XCTAssertEqual(captured.map(\.method), ["POST", "GET", "POST"])
+        XCTAssertTrue(captured.allSatisfy { $0.authorization == "Bearer test-token" })
+    }
+
     func testPromptAssemblyLoadsAgentsAndExplicitSkill() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("SwiftCodexCoreTests-\(UUID().uuidString)")
         let work = root.appendingPathComponent("service")
@@ -505,5 +584,111 @@ private struct ApprovalEchoTool: AgentTool {
 
     func run(arguments: JSONValue, context: ToolExecutionContext) async throws -> ToolResult {
         ToolResult(content: try arguments.requiredString("text"))
+    }
+}
+
+private struct StaticAuthProvider: AuthorizationProvider {
+    func authorizationHeaders() async throws -> [String: String] {
+        ["Authorization": "Bearer test-token"]
+    }
+}
+
+private struct CapturedHTTPRequest: Sendable, Equatable {
+    var method: String
+    var path: String
+    var authorization: String?
+
+    init(_ request: URLRequest) {
+        method = request.httpMethod ?? ""
+        path = request.url?.path ?? ""
+        authorization = request.value(forHTTPHeaderField: "Authorization")
+    }
+}
+
+private final class Locked<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: Value
+
+    init(_ value: Value) {
+        storage = value
+    }
+
+    var value: Value {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func withValue(_ body: (inout Value) -> Void) {
+        lock.lock()
+        body(&storage)
+        lock.unlock()
+    }
+}
+
+private final class StubURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let handler = Self.handler else {
+            client?.urlProtocol(self, didFailWithError: CodexCoreError.transportError("No stub handler registered"))
+            return
+        }
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+
+    static func response(for request: URLRequest, statusCode: Int = 200, json: String) -> (HTTPURLResponse, Data) {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: statusCode,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        return (response, Data(json.utf8))
+    }
+}
+
+private extension URLRequest {
+    func bodyData() throws -> Data {
+        if let httpBody {
+            return httpBody
+        }
+        guard let stream = httpBodyStream else {
+            return Data()
+        }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        let bufferSize = 4096
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+        defer { buffer.deallocate() }
+        while stream.hasBytesAvailable {
+            let read = stream.read(buffer, maxLength: bufferSize)
+            if read < 0 {
+                throw stream.streamError ?? CodexCoreError.transportError("Could not read request body stream")
+            }
+            if read == 0 {
+                break
+            }
+            data.append(buffer, count: read)
+        }
+        return data
     }
 }

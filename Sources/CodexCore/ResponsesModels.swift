@@ -104,6 +104,8 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
     public var input: [JSONValue]
     public var tools: [ResponseToolDefinition]
     public var stream: Bool
+    public var background: Bool?
+    public var store: Bool?
     public var previousResponseID: String?
     public var metadata: [String: JSONValue]
     public var parallelToolCalls: Bool?
@@ -114,6 +116,8 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
         case input
         case tools
         case stream
+        case background
+        case store
         case previousResponseID = "previous_response_id"
         case metadata
         case parallelToolCalls = "parallel_tool_calls"
@@ -125,6 +129,8 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
         input: [JSONValue],
         tools: [ResponseToolDefinition] = [],
         stream: Bool = true,
+        background: Bool? = nil,
+        store: Bool? = nil,
         previousResponseID: String? = nil,
         metadata: [String: JSONValue] = [:],
         parallelToolCalls: Bool? = true
@@ -134,9 +140,48 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
         self.input = input
         self.tools = tools
         self.stream = stream
+        self.background = background
+        self.store = store
         self.previousResponseID = previousResponseID
         self.metadata = metadata
         self.parallelToolCalls = parallelToolCalls
+    }
+}
+
+public struct OpenAIResponseSnapshot: Codable, Sendable, Equatable {
+    public var id: String?
+    public var status: String?
+    public var background: Bool?
+    public var outputText: String
+    public var usage: TokenUsage?
+    public var errorMessage: String?
+    public var raw: JSONValue
+
+    public init(
+        id: String? = nil,
+        status: String? = nil,
+        background: Bool? = nil,
+        outputText: String = "",
+        usage: TokenUsage? = nil,
+        errorMessage: String? = nil,
+        raw: JSONValue = .object([:])
+    ) {
+        self.id = id
+        self.status = status
+        self.background = background
+        self.outputText = outputText
+        self.usage = usage
+        self.errorMessage = errorMessage
+        self.raw = raw
+    }
+
+    public var isTerminal: Bool {
+        switch status?.lowercased() {
+        case "completed", "failed", "cancelled", "canceled", "incomplete", "expired":
+            return true
+        default:
+            return false
+        }
     }
 }
 

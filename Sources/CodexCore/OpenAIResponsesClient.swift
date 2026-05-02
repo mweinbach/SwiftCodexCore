@@ -59,6 +59,54 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         }
     }
 
+    /// Starts a Responses API background job and returns the persisted response snapshot.
+    ///
+    /// The returned snapshot can be saved by the host app and refreshed later with
+    /// ``retrieveResponse(id:)``. This is the primitive iOS hosts need for work that
+    /// should continue on the server after the app is suspended.
+    public func createBackgroundResponse(_ request: ResponsesRequest) async throws -> OpenAIResponseSnapshot {
+        var backgroundRequest = request
+        backgroundRequest.background = true
+        backgroundRequest.stream = false
+        if backgroundRequest.store == nil {
+            backgroundRequest.store = true
+        }
+        let body = try JSONEncoder.codexCompact.encode(backgroundRequest)
+        let data = try await sendData(
+            method: "POST",
+            url: options.endpoint,
+            body: body,
+            accept: "application/json",
+            allowRefresh: true
+        )
+        return try Self.parseResponseSnapshot(data: data)
+    }
+
+    /// Retrieves the latest persisted response snapshot for a foreground or background response id.
+    public func retrieveResponse(id: String) async throws -> OpenAIResponseSnapshot {
+        let data = try await sendData(
+            method: "GET",
+            url: responseURL(id: id),
+            body: nil,
+            accept: "application/json",
+            allowRefresh: true
+        )
+        return try Self.parseResponseSnapshot(data: data)
+    }
+
+    /// Requests cancellation for an in-progress background response.
+    @discardableResult
+    public func cancelResponse(id: String) async throws -> OpenAIResponseSnapshot {
+        let data = try await sendData(
+            method: "POST",
+            url: responseURL(id: id).appendingPathComponent("cancel"),
+            body: Data(),
+            accept: "application/json",
+            allowRefresh: true
+        )
+        return try Self.parseResponseSnapshot(data: data)
+    }
+
     private func send(_ request: ResponsesRequest, allowRefresh: Bool) async throws -> (URLSession.AsyncBytes, HTTPURLResponse) {
         let (bytes, response) = try await session.bytes(for: try makeURLRequest(request))
         guard let http = response as? HTTPURLResponse else {
@@ -77,14 +125,47 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     }
 
     private func makeURLRequest(_ request: ResponsesRequest) async throws -> URLRequest {
-        var urlRequest = URLRequest(url: options.endpoint, timeoutInterval: options.requestTimeout)
-        urlRequest.httpMethod = "POST"
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        urlRequest.setValue("text/event-stream, application/json", forHTTPHeaderField: "Accept")
+        try await makeURLRequest(
+            method: "POST",
+            url: options.endpoint,
+            body: JSONEncoder.codexCompact.encode(request),
+            accept: "text/event-stream, application/json"
+        )
+    }
+
+    private func sendData(method: String, url: URL, body: Data?, accept: String, allowRefresh: Bool) async throws -> Data {
+        let request = try await makeURLRequest(method: method, url: url, body: body, accept: accept)
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw CodexCoreError.transportError("Responses API did not return an HTTP response")
+        }
+        if http.statusCode == 401, allowRefresh, let refreshing = auth as? any TokenRefreshingAuthorizationProvider {
+            try await refreshing.refreshNow()
+            return try await sendData(method: method, url: url, body: body, accept: accept, allowRefresh: false)
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw CodexCoreError.transportError("Responses API HTTP \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "")")
+        }
+        return data
+    }
+
+    private func makeURLRequest(method: String, url: URL, body: Data?, accept: String) async throws -> URLRequest {
+        var urlRequest = URLRequest(url: url, timeoutInterval: options.requestTimeout)
+        urlRequest.httpMethod = method
+        urlRequest.setValue(accept, forHTTPHeaderField: "Accept")
+        if let body {
+            urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            if !body.isEmpty {
+                urlRequest.httpBody = body
+            }
+        }
         for (key, value) in try await auth.authorizationHeaders() { urlRequest.setValue(value, forHTTPHeaderField: key) }
         for (key, value) in options.extraHeaders { urlRequest.setValue(value, forHTTPHeaderField: key) }
-        urlRequest.httpBody = try JSONEncoder.codexCompact.encode(request)
         return urlRequest
+    }
+
+    private func responseURL(id: String) -> URL {
+        options.endpoint.appendingPathComponent(id)
     }
 
     private func collectBody(_ bytes: URLSession.AsyncBytes) async throws -> Data {
@@ -156,6 +237,11 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         for event in events { continuation.yield(event) }
     }
 
+    private static func parseResponseSnapshot(data: Data) throws -> OpenAIResponseSnapshot {
+        let json = try JSONDecoder.codex.decode(JSONValue.self, from: data)
+        return responseSnapshot(from: json)
+    }
+
     private static func emitEvent(named eventName: String?, dataString: String, continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation) throws {
         guard let data = dataString.data(using: .utf8) else { return }
         let json = try JSONDecoder.codex.decode(JSONValue.self, from: data)
@@ -224,6 +310,18 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         return events
     }
 
+    private static func responseSnapshot(from json: JSONValue) -> OpenAIResponseSnapshot {
+        OpenAIResponseSnapshot(
+            id: json["id"]?.stringValue,
+            status: json["status"]?.stringValue,
+            background: json["background"]?.boolValue,
+            outputText: extractOutputText(fromResponseObject: json),
+            usage: json["usage"].flatMap(parseUsage),
+            errorMessage: errorMessage(fromResponseObject: json),
+            raw: json
+        )
+    }
+
     private static func toolCall(fromOutputItem item: JSONValue) throws -> ToolCall? {
         guard item["type"]?.stringValue == "function_call" else { return nil }
         let callID = item["call_id"]?.stringValue ?? item["id"]?.stringValue ?? UUID().uuidString
@@ -261,6 +359,26 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
             }
         }
         return parts.joined()
+    }
+
+    private static func extractOutputText(fromResponseObject json: JSONValue) -> String {
+        if let text = json["output_text"]?.stringValue {
+            return text
+        }
+        guard let outputs = json["output"]?.arrayValue else {
+            return ""
+        }
+        return outputs.compactMap(extractText).joined()
+    }
+
+    private static func errorMessage(fromResponseObject json: JSONValue) -> String? {
+        if let message = json["error"]?["message"]?.stringValue {
+            return message
+        }
+        if let message = json["incomplete_details"]?["reason"]?.stringValue {
+            return message
+        }
+        return nil
     }
 
     private static func parseUsage(_ value: JSONValue) -> TokenUsage? {
