@@ -6,11 +6,13 @@ public struct JustBashCodexEnvironment: Sendable {
     public var runtime: CodexRuntime
     public var bash: Bash
     public var workspaceRootURL: URL
+    public var defaultCWD: String?
 
-    public init(runtime: CodexRuntime, bash: Bash, workspaceRootURL: URL) {
+    public init(runtime: CodexRuntime, bash: Bash, workspaceRootURL: URL, defaultCWD: String? = nil) {
         self.runtime = runtime
         self.bash = bash
         self.workspaceRootURL = workspaceRootURL
+        self.defaultCWD = defaultCWD
     }
 }
 
@@ -20,6 +22,7 @@ public enum JustBashCodexFactory {
         workspaceRootURL: URL,
         username: String = "coder",
         configuration: AgentConfiguration = AgentConfiguration(),
+        defaultCWD: String? = nil,
         embeddedSkills: [EmbeddedAgentSkill] = [],
         embeddedSkillsRootName: String = "bundled",
         embeddedSkillsRootURL: URL? = nil,
@@ -39,10 +42,10 @@ public enum JustBashCodexFactory {
             configuration: config,
             modelProvider: modelProvider,
             threadStore: threadStore,
-            tools: justBashCodexTools(bash: bash),
+            tools: justBashCodexTools(bash: bash, defaultCWD: defaultCWD),
             approvalHandler: approvalHandler
         )
-        return JustBashCodexEnvironment(runtime: runtime, bash: bash, workspaceRootURL: workspaceRootURL)
+        return JustBashCodexEnvironment(runtime: runtime, bash: bash, workspaceRootURL: workspaceRootURL, defaultCWD: defaultCWD)
     }
 }
 

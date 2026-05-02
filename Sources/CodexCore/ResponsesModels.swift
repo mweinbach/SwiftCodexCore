@@ -104,6 +104,7 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
     public var input: [JSONValue]
     public var tools: [ResponseToolDefinition]
     public var stream: Bool
+    public var reasoning: ResponseReasoning?
     public var background: Bool?
     public var store: Bool?
     public var previousResponseID: String?
@@ -116,6 +117,7 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
         case input
         case tools
         case stream
+        case reasoning
         case background
         case store
         case previousResponseID = "previous_response_id"
@@ -129,6 +131,7 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
         input: [JSONValue],
         tools: [ResponseToolDefinition] = [],
         stream: Bool = true,
+        reasoning: ResponseReasoning? = nil,
         background: Bool? = nil,
         store: Bool? = nil,
         previousResponseID: String? = nil,
@@ -140,11 +143,29 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
         self.input = input
         self.tools = tools
         self.stream = stream
+        self.reasoning = reasoning
         self.background = background
         self.store = store
         self.previousResponseID = previousResponseID
         self.metadata = metadata
         self.parallelToolCalls = parallelToolCalls
+    }
+}
+
+public struct ResponseReasoning: Codable, Sendable, Equatable {
+    public var effort: String?
+    public var summary: String?
+
+    public init(effort: String? = nil, summary: String? = nil) {
+        self.effort = effort
+        self.summary = summary
+    }
+
+    public init?(effort: ReasoningEffort?, summary: ReasoningSummary?) {
+        let summaryValue = summary == ReasoningSummary.none ? nil : summary?.rawValue
+        guard effort != nil || summaryValue != nil else { return nil }
+        self.effort = effort?.rawValue
+        self.summary = summaryValue
     }
 }
 

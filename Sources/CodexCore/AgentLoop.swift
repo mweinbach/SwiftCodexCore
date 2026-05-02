@@ -159,6 +159,8 @@ public final class CodexAgent: Sendable {
                 input: responseInputs,
                 tools: toolDefinitions,
                 stream: true,
+                reasoning: ResponseReasoning(effort: configuration.reasoningEffort, summary: configuration.reasoningSummary),
+                store: configuration.backgroundAccessEnabled ? true : nil,
                 previousResponseID: nextInputUsesPreviousResponse ? lastResponseID : nil,
                 metadata: ["thread_id": .string(threadID), "turn_id": .string(turnID), "iteration": .number(Double(iteration))],
                 parallelToolCalls: true

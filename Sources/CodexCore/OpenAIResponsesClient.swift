@@ -107,6 +107,12 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         return try Self.parseResponseSnapshot(data: data)
     }
 
+    /// Converts a retrieved foreground/background response snapshot into the same events
+    /// emitted by non-streaming Responses calls.
+    public static func modelEvents(from snapshot: OpenAIResponseSnapshot) throws -> [ModelStreamEvent] {
+        try eventsFromResponseObject(snapshot.raw)
+    }
+
     private func send(_ request: ResponsesRequest, allowRefresh: Bool) async throws -> (URLSession.AsyncBytes, HTTPURLResponse) {
         let (bytes, response) = try await session.bytes(for: try makeURLRequest(request))
         guard let http = response as? HTTPURLResponse else {

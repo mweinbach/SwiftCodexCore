@@ -35,6 +35,29 @@ final class CodexCoreJustBashTests: XCTestCase {
         XCTAssertEqual(read.content, "hello")
     }
 
+    func testJustBashToolsUseDefaultCWD() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("SwiftCodexCoreJustBash-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let bash = Bash(options: try .codingAgentWorkspace(rootURL: root))
+        _ = await bash.exec("mkdir -p /Users/coder/project")
+        let registry = ToolRegistry(tools: justBashCodexTools(bash: bash, defaultCWD: "/Users/coder/project"))
+        let context = ToolExecutionContext(threadID: "t", turnID: "u", approvalPolicy: .never, sandboxPolicy: .workspaceWrite)
+
+        _ = try await registry.run(
+            name: "write_file",
+            arguments: .object(["path": .string("scoped.txt"), "content": .string("project")]),
+            context: context
+        )
+
+        let read = try await registry.run(
+            name: "shell",
+            arguments: .object(["command": .string("pwd && cat scoped.txt")]),
+            context: context
+        )
+        XCTAssertTrue(read.content.contains("/Users/coder/project"))
+        XCTAssertTrue(read.content.contains("project"))
+    }
+
     func testJustBashApplyPatchEditsVirtualFile() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("SwiftCodexCoreJustBash-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -117,6 +140,7 @@ final class CodexCoreJustBashTests: XCTestCase {
         let environment = try JustBashCodexFactory.makeEnvironment(
             modelProvider: ScriptedModelProvider(batches: []),
             workspaceRootURL: workspace,
+            defaultCWD: "/Users/coder/project",
             embeddedSkills: [
                 EmbeddedAgentSkill(
                     name: "artifact-writer",
@@ -128,6 +152,7 @@ final class CodexCoreJustBashTests: XCTestCase {
             embeddedSkillsRootURL: skillsRoot
         )
 
+        XCTAssertEqual(environment.defaultCWD, "/Users/coder/project")
         let result = await environment.bash.exec("primary-runtime-skills-check")
         XCTAssertNotEqual(result.exitCode, 127)
         XCTAssertTrue(result.stdout.contains(#""platform": "ios""#))

@@ -146,6 +146,9 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
     public var approvalPolicy: ApprovalPolicy
     public var sandboxPolicy: SandboxPolicy
     public var includeReasoningDeltas: Bool
+    public var reasoningEffort: ReasoningEffort?
+    public var reasoningSummary: ReasoningSummary?
+    public var backgroundAccessEnabled: Bool
     public var projectInstructionOptions: ProjectInstructionOptions
     public var skillOptions: SkillInjectionOptions
     public var serverTools: [ResponseToolDefinition]
@@ -161,6 +164,9 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
         approvalPolicy: ApprovalPolicy = .onRequest,
         sandboxPolicy: SandboxPolicy = .workspaceWrite,
         includeReasoningDeltas: Bool = true,
+        reasoningEffort: ReasoningEffort? = nil,
+        reasoningSummary: ReasoningSummary? = nil,
+        backgroundAccessEnabled: Bool = false,
         projectInstructionOptions: ProjectInstructionOptions = ProjectInstructionOptions(),
         skillOptions: SkillInjectionOptions = SkillInjectionOptions(),
         serverTools: [ResponseToolDefinition] = []
@@ -175,10 +181,28 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
         self.approvalPolicy = approvalPolicy
         self.sandboxPolicy = sandboxPolicy
         self.includeReasoningDeltas = includeReasoningDeltas
+        self.reasoningEffort = reasoningEffort
+        self.reasoningSummary = reasoningSummary
+        self.backgroundAccessEnabled = backgroundAccessEnabled
         self.projectInstructionOptions = projectInstructionOptions
         self.skillOptions = skillOptions
         self.serverTools = serverTools
     }
+}
+
+public enum ReasoningEffort: String, Codable, Sendable, Equatable, CaseIterable {
+    case minimal
+    case low
+    case medium
+    case high
+    case xhigh
+}
+
+public enum ReasoningSummary: String, Codable, Sendable, Equatable, CaseIterable {
+    case none
+    case auto
+    case concise
+    case detailed
 }
 
 

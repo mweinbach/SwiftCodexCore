@@ -116,6 +116,31 @@ final class CodexCoreTests: XCTestCase {
         for try await _ in handle.events {}
     }
 
+    func testAgentLoopAddsReasoningAndStoredResponseConfig() async throws {
+        let provider = RecordingModelProvider(batches: [
+            [
+                .outputTextDelta("done"),
+                .completed(responseID: "r1", usage: nil)
+            ]
+        ])
+        let config = AgentConfiguration(
+            model: "gpt-5.4",
+            reasoningEffort: .high,
+            reasoningSummary: .auto,
+            backgroundAccessEnabled: true
+        )
+        let runtime = CodexRuntime(configuration: config, modelProvider: provider, tools: [])
+        let thread = try await runtime.createThread()
+        let handle = try await runtime.startTurn(threadID: thread.id, input: TurnInput("go"))
+
+        for try await _ in handle.events {}
+
+        let request = try XCTUnwrap(provider.requests.first)
+        XCTAssertEqual(request.reasoning?.effort, "high")
+        XCTAssertEqual(request.reasoning?.summary, "auto")
+        XCTAssertEqual(request.store, true)
+    }
+
     func testNetworkServerToolsAreFilteredWhenSandboxDisallowsNetwork() async throws {
         let provider = RecordingModelProvider(batches: [
             [.outputTextDelta("done"), .completed(responseID: "r1", usage: nil)]
@@ -221,6 +246,7 @@ final class CodexCoreTests: XCTestCase {
             model: "gpt-5.4",
             input: [ResponseInputBuilder.userMessage("work on this later")],
             stream: false,
+            reasoning: ResponseReasoning(effort: .high, summary: .auto),
             background: true,
             store: true
         )
@@ -229,6 +255,8 @@ final class CodexCoreTests: XCTestCase {
         XCTAssertEqual(json["background"]?.boolValue, true)
         XCTAssertEqual(json["store"]?.boolValue, true)
         XCTAssertEqual(json["stream"]?.boolValue, false)
+        XCTAssertEqual(json["reasoning"]?["effort"]?.stringValue, "high")
+        XCTAssertEqual(json["reasoning"]?["summary"]?.stringValue, "auto")
     }
 
     func testOpenAIResponsesClientBackgroundLifecycleUsesResponseEndpoints() async throws {
@@ -293,6 +321,43 @@ final class CodexCoreTests: XCTestCase {
         let captured = requests.value
         XCTAssertEqual(captured.map(\.method), ["POST", "GET", "POST"])
         XCTAssertTrue(captured.allSatisfy { $0.authorization == "Bearer test-token" })
+    }
+
+    func testOpenAIResponsesClientExtractsSnapshotModelEvents() throws {
+        let snapshot = OpenAIResponseSnapshot(
+            id: "resp_123",
+            status: "completed",
+            background: true,
+            raw: .object([
+                "id": .string("resp_123"),
+                "status": .string("completed"),
+                "output": .array([
+                    .object([
+                        "type": .string("function_call"),
+                        "id": .string("item_call"),
+                        "call_id": .string("call_1"),
+                        "name": .string("shell"),
+                        "arguments": .string(#"{"command":"pwd"}"#)
+                    ]),
+                    .object([
+                        "type": .string("message"),
+                        "content": .array([
+                            .object(["text": .string("done")])
+                        ])
+                    ])
+                ])
+            ])
+        )
+
+        let events = try OpenAIResponsesClient.modelEvents(from: snapshot)
+        XCTAssertTrue(events.contains { event in
+            if case .toolCallCompleted(let call) = event {
+                return call.callID == "call_1" && call.name == "shell"
+            }
+            return false
+        })
+        XCTAssertTrue(events.contains(.messageCompleted("done")))
+        XCTAssertTrue(events.contains(.completed(responseID: "resp_123", usage: nil)))
     }
 
     func testPromptAssemblyLoadsAgentsAndExplicitSkill() throws {
