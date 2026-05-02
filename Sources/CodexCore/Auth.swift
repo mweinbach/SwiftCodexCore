@@ -2,6 +2,9 @@ import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+#if canImport(Security)
+import Security
+#endif
 
 public enum AuthMode: String, Codable, Sendable, Equatable {
     case apiKey
@@ -48,6 +51,17 @@ public protocol TokenRefreshingAuthorizationProvider: AuthorizationProvider {
     func refreshNow() async throws
 }
 
+public protocol AuthSessionStore: Sendable {
+    func loadSession() async throws -> AuthSession?
+    func saveSession(_ session: AuthSession) async throws
+    func clear() async throws
+}
+
+public protocol CodexAuthCacheStore: AuthSessionStore {
+    func load() async throws -> CodexAuthDotJson?
+    func save(_ auth: CodexAuthDotJson) async throws
+}
+
 public struct APIKeyAuthProvider: AuthorizationProvider {
     public var apiKey: String
     public var organization: String?
@@ -67,26 +81,34 @@ public struct APIKeyAuthProvider: AuthorizationProvider {
     }
 }
 
-public actor FileAuthStore {
+public actor FileAuthStore: AuthSessionStore {
     public let fileURL: URL
 
     public init(fileURL: URL = CodexDefaultLocations.coreDirectory.appendingPathComponent("auth.json")) {
         self.fileURL = fileURL
     }
 
-    public func load() throws -> AuthSession? {
+    public func load() async throws -> AuthSession? {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
         let data = try Data(contentsOf: fileURL)
         return try JSONDecoder.codex.decode(AuthSession.self, from: data)
     }
 
-    public func save(_ session: AuthSession) throws {
+    public func loadSession() async throws -> AuthSession? {
+        try await load()
+    }
+
+    public func save(_ session: AuthSession) async throws {
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let data = try JSONEncoder.codexPretty.encode(session)
         try data.write(to: fileURL, options: [.atomic])
     }
 
-    public func clear() throws {
+    public func saveSession(_ session: AuthSession) async throws {
+        try await save(session)
+    }
+
+    public func clear() async throws {
         if FileManager.default.fileExists(atPath: fileURL.path) {
             try FileManager.default.removeItem(at: fileURL)
         }
@@ -102,10 +124,14 @@ public struct CodexAuthDotJson: Codable, Sendable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case authMode = "auth_mode"
-        case openaiAPIKey = "openai_api_key"
+        case openaiAPIKey = "OPENAI_API_KEY"
         case tokens
         case lastRefresh = "last_refresh"
         case agentIdentity = "agent_identity"
+    }
+
+    enum LegacyCodingKeys: String, CodingKey {
+        case openaiAPIKey = "openai_api_key"
     }
 
     public init(authMode: String? = nil, openaiAPIKey: String? = nil, tokens: CodexTokenData? = nil, lastRefresh: Date? = nil, agentIdentity: JSONValue? = nil) {
@@ -118,8 +144,10 @@ public struct CodexAuthDotJson: Codable, Sendable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let legacyContainer = try decoder.container(keyedBy: LegacyCodingKeys.self)
         authMode = try container.decodeIfPresent(String.self, forKey: .authMode)
         openaiAPIKey = try container.decodeIfPresent(String.self, forKey: .openaiAPIKey)
+            ?? legacyContainer.decodeIfPresent(String.self, forKey: .openaiAPIKey)
         tokens = try container.decodeIfPresent(CodexTokenData.self, forKey: .tokens)
         agentIdentity = try container.decodeIfPresent(JSONValue.self, forKey: .agentIdentity)
         if let dateString = try container.decodeIfPresent(String.self, forKey: .lastRefresh) {
@@ -158,6 +186,7 @@ public struct CodexAuthDotJson: Codable, Sendable, Equatable {
         if let openaiAPIKey { metadata["openai_api_key"] = .string(openaiAPIKey) }
         let expiry = tokens.accessToken.flatMap { JWT.payload($0)?["exp"]?.doubleValue }.map { Date(timeIntervalSince1970: $0) }
         let accountID = tokens.accountID ?? tokens.idToken.flatMap(JWT.extractChatGPTAccountID) ?? tokens.accessToken.flatMap { JWT.payload($0).flatMap(JWT.extractChatGPTAccountID) }
+        let workspaceID = tokens.idToken.flatMap(JWT.extractOrganizationID)
         return AuthSession(
             mode: .chatGPT,
             apiKey: openaiAPIKey,
@@ -165,7 +194,7 @@ public struct CodexAuthDotJson: Codable, Sendable, Equatable {
             refreshToken: tokens.refreshToken,
             expiresAt: expiry,
             accountID: accountID,
-            workspaceID: tokens.idToken.flatMap(JWT.extractOrganizationID),
+            workspaceID: workspaceID,
             metadata: metadata
         )
     }
@@ -193,9 +222,37 @@ public struct CodexTokenData: Codable, Sendable, Equatable {
         self.accountID = accountID
         self.rawIDToken = rawIDToken
     }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        accessToken = try container.decodeIfPresent(String.self, forKey: .accessToken)
+        refreshToken = try container.decodeIfPresent(String.self, forKey: .refreshToken)
+        accountID = try container.decodeIfPresent(String.self, forKey: .accountID)
+        rawIDToken = try container.decodeIfPresent(String.self, forKey: .rawIDToken)
+        if let raw = try? container.decodeIfPresent(String.self, forKey: .idToken) {
+            rawIDToken = rawIDToken ?? raw
+            idToken = JWT.payload(raw) ?? .string(raw)
+        } else {
+            idToken = try container.decodeIfPresent(JSONValue.self, forKey: .idToken)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        if let rawIDToken {
+            try container.encode(rawIDToken, forKey: .idToken)
+        } else if case .string(let raw)? = idToken {
+            try container.encode(raw, forKey: .idToken)
+        } else {
+            try container.encodeIfPresent(idToken, forKey: .idToken)
+        }
+        try container.encodeIfPresent(accessToken, forKey: .accessToken)
+        try container.encodeIfPresent(refreshToken, forKey: .refreshToken)
+        try container.encodeIfPresent(accountID, forKey: .accountID)
+    }
 }
 
-public actor CodexAuthStore {
+public actor CodexAuthStore: CodexAuthCacheStore {
     public let codexHome: URL
     public let authFileURL: URL
 
@@ -208,25 +265,25 @@ public actor CodexAuthStore {
         CodexDefaultLocations.codexHome
     }
 
-    public func load() throws -> CodexAuthDotJson? {
+    public func load() async throws -> CodexAuthDotJson? {
         guard FileManager.default.fileExists(atPath: authFileURL.path) else { return nil }
         let data = try Data(contentsOf: authFileURL)
         return try JSONDecoder.codex.decode(CodexAuthDotJson.self, from: data)
     }
 
-    public func loadSession() throws -> AuthSession? {
-        try load()?.asAuthSession()
+    public func loadSession() async throws -> AuthSession? {
+        try await load()?.asAuthSession()
     }
 
-    public func save(_ auth: CodexAuthDotJson) throws {
+    public func save(_ auth: CodexAuthDotJson) async throws {
         try FileManager.default.createDirectory(at: codexHome, withIntermediateDirectories: true)
         let data = try JSONEncoder.codexPretty.encode(auth)
         try data.write(to: authFileURL, options: [.atomic])
     }
 
-    public func saveSession(_ session: AuthSession) throws {
+    public func saveSession(_ session: AuthSession) async throws {
         guard session.mode == .chatGPT else {
-            try save(CodexAuthDotJson(authMode: session.mode == .apiKey ? "apikey" : session.mode.rawValue, openaiAPIKey: session.apiKey, lastRefresh: Date()))
+            try await save(CodexAuthDotJson(authMode: session.mode == .apiKey ? "apikey" : session.mode.rawValue, openaiAPIKey: session.apiKey, lastRefresh: Date()))
             return
         }
         let idClaims = session.metadata["id_token_claims"]
@@ -243,15 +300,108 @@ public actor CodexAuthStore {
             ),
             lastRefresh: Date()
         )
-        try save(auth)
+        try await save(auth)
     }
 
-    public func clear() throws {
+    public func clear() async throws {
         if FileManager.default.fileExists(atPath: authFileURL.path) {
             try FileManager.default.removeItem(at: authFileURL)
         }
     }
 }
+
+#if canImport(Security)
+public actor CodexKeychainAuthStore: CodexAuthCacheStore {
+    public let service: String
+    public let account: String
+    public let accessGroup: String?
+    public let accessible: CFString
+
+    public init(
+        service: String = "Codex Auth",
+        account: String = CodexDefaultLocations.codexHome.path,
+        accessGroup: String? = nil,
+        accessible: CFString = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    ) {
+        self.service = service
+        self.account = account
+        self.accessGroup = accessGroup
+        self.accessible = accessible
+    }
+
+    public func load() async throws -> CodexAuthDotJson? {
+        var query = baseQuery()
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess else {
+            throw CodexCoreError.authError("Keychain auth load failed with status \(status)")
+        }
+        guard let data = item as? Data else {
+            throw CodexCoreError.authError("Keychain auth item did not contain data")
+        }
+        return try JSONDecoder.codex.decode(CodexAuthDotJson.self, from: data)
+    }
+
+    public func loadSession() async throws -> AuthSession? {
+        try await load()?.asAuthSession()
+    }
+
+    public func save(_ auth: CodexAuthDotJson) async throws {
+        let data = try JSONEncoder.codexPretty.encode(auth)
+        var query = baseQuery()
+        SecItemDelete(query as CFDictionary)
+        query[kSecValueData as String] = data
+        query[kSecAttrAccessible as String] = accessible
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw CodexCoreError.authError("Keychain auth save failed with status \(status)")
+        }
+    }
+
+    public func saveSession(_ session: AuthSession) async throws {
+        guard session.mode == .chatGPT else {
+            try await save(CodexAuthDotJson(authMode: session.mode == .apiKey ? "apikey" : session.mode.rawValue, openaiAPIKey: session.apiKey, lastRefresh: Date()))
+            return
+        }
+        let idClaims = session.metadata["id_token_claims"]
+        let rawIDToken = session.metadata["raw_id_token"]?.stringValue
+        try await save(CodexAuthDotJson(
+            authMode: "chatgpt",
+            openaiAPIKey: session.metadata["openai_api_key"]?.stringValue ?? session.apiKey,
+            tokens: CodexTokenData(
+                idToken: idClaims,
+                accessToken: session.accessToken,
+                refreshToken: session.refreshToken,
+                accountID: session.accountID,
+                rawIDToken: rawIDToken
+            ),
+            lastRefresh: Date()
+        ))
+    }
+
+    public func clear() async throws {
+        let status = SecItemDelete(baseQuery() as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw CodexCoreError.authError("Keychain auth delete failed with status \(status)")
+        }
+    }
+
+    private func baseQuery() -> [String: Any] {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        if let accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup
+        }
+        return query
+    }
+}
+#endif
 
 public struct CodexChatGPTAuthConfig: Sendable, Equatable {
     public static let codexCLIClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -338,8 +488,7 @@ public actor ChatGPTAuthProvider: TokenRefreshingAuthorizationProvider {
     public typealias RefreshHandler = @Sendable (AuthSession) async throws -> AuthSession
 
     private var session: AuthSession
-    private let legacyStore: FileAuthStore?
-    private let codexStore: CodexAuthStore?
+    private let sessionStores: [any AuthSessionStore]
     private let refreshHandler: RefreshHandler?
     private let refreshSkew: TimeInterval
     private let config: CodexChatGPTAuthConfig
@@ -348,15 +497,14 @@ public actor ChatGPTAuthProvider: TokenRefreshingAuthorizationProvider {
     public init(
         session: AuthSession,
         store: FileAuthStore? = nil,
-        codexStore: CodexAuthStore? = nil,
+        codexStore: (any CodexAuthCacheStore)? = nil,
         config: CodexChatGPTAuthConfig = CodexChatGPTAuthConfig(),
         refreshSkew: TimeInterval = 300,
         refreshHandler: RefreshHandler? = nil,
         urlSession: URLSession = .shared
     ) {
         self.session = session
-        self.legacyStore = store
-        self.codexStore = codexStore
+        self.sessionStores = [store as (any AuthSessionStore)?, codexStore as (any AuthSessionStore)?].compactMap { $0 }
         self.config = config
         self.refreshHandler = refreshHandler
         self.refreshSkew = refreshSkew
@@ -376,6 +524,19 @@ public actor ChatGPTAuthProvider: TokenRefreshingAuthorizationProvider {
         return ChatGPTAuthProvider(session: session, codexStore: store, config: config, refreshSkew: refreshSkew, refreshHandler: refreshHandler, urlSession: urlSession)
     }
 
+    public static func fromCodexAuthStore(
+        _ store: any CodexAuthCacheStore,
+        config: CodexChatGPTAuthConfig = CodexChatGPTAuthConfig(),
+        refreshSkew: TimeInterval = 300,
+        refreshHandler: RefreshHandler? = nil,
+        urlSession: URLSession = .shared
+    ) async throws -> ChatGPTAuthProvider {
+        guard let session = try await store.loadSession() else {
+            throw CodexCoreError.authError("No Codex auth cache found")
+        }
+        return ChatGPTAuthProvider(session: session, codexStore: store, config: config, refreshSkew: refreshSkew, refreshHandler: refreshHandler, urlSession: urlSession)
+    }
+
     public static func accessToken(_ token: String, accountID: String? = nil, workspaceID: String? = nil) -> ChatGPTAuthProvider {
         ChatGPTAuthProvider(session: AuthSession(mode: .chatGPT, accessToken: token, accountID: accountID, workspaceID: workspaceID))
     }
@@ -384,8 +545,9 @@ public actor ChatGPTAuthProvider: TokenRefreshingAuthorizationProvider {
 
     public func updateSession(_ newSession: AuthSession) async throws {
         session = newSession
-        try await legacyStore?.save(newSession)
-        try await codexStore?.saveSession(newSession)
+        for store in sessionStores {
+            try await store.saveSession(newSession)
+        }
     }
 
     public func authorizationHeaders() async throws -> [String: String] {
@@ -408,8 +570,9 @@ public actor ChatGPTAuthProvider: TokenRefreshingAuthorizationProvider {
         } else {
             session = try await httpClient.refresh(session: session)
         }
-        try await legacyStore?.save(session)
-        try await codexStore?.saveSession(session)
+        for store in sessionStores {
+            try await store.saveSession(session)
+        }
     }
 
     private func needsRefresh() -> Bool {
@@ -422,10 +585,10 @@ public actor ChatGPTAuthProvider: TokenRefreshingAuthorizationProvider {
 
 public final class CodexChatGPTAuthClient: Sendable {
     public let config: CodexChatGPTAuthConfig
-    public let store: CodexAuthStore
+    public let store: any CodexAuthCacheStore
     private let session: URLSession
 
-    public init(config: CodexChatGPTAuthConfig = CodexChatGPTAuthConfig(), store: CodexAuthStore? = nil, session: URLSession = .shared) {
+    public init(config: CodexChatGPTAuthConfig = CodexChatGPTAuthConfig(), store: (any CodexAuthCacheStore)? = nil, session: URLSession = .shared) {
         self.config = config
         self.store = store ?? CodexAuthStore(codexHome: config.codexHome)
         self.session = session

@@ -377,6 +377,62 @@ final class CodexCoreTests: XCTestCase {
         XCTAssertEqual(session.refreshToken, "refresh")
     }
 
+    func testCodexAuthCacheAcceptsBaseCodexShape() throws {
+        let idPayload: JSONValue = .object([
+            "https://api.openai.com/auth": .object([
+                "chatgpt_account_id": .string("acct_base"),
+                "organization_id": .string("org_base")
+            ])
+        ])
+        let rawIDToken = try Self.fakeJWT(payload: idPayload)
+        let access = try Self.fakeJWT(payload: .object(["exp": .number(Date().addingTimeInterval(3600).timeIntervalSince1970)]))
+        let data = """
+        {
+          "OPENAI_API_KEY": "sk-base",
+          "tokens": {
+            "id_token": "\(rawIDToken)",
+            "access_token": "\(access)",
+            "refresh_token": "refresh-base",
+            "account_id": "acct_base"
+          },
+          "last_refresh": "2026-01-01T00:00:00Z"
+        }
+        """.data(using: .utf8)!
+
+        let decoded = try JSONDecoder.codex.decode(CodexAuthDotJson.self, from: data)
+        let session = try XCTUnwrap(decoded.asAuthSession())
+        XCTAssertEqual(decoded.openaiAPIKey, "sk-base")
+        XCTAssertEqual(session.accountID, "acct_base")
+        XCTAssertEqual(session.workspaceID, "org_base")
+        XCTAssertEqual(session.metadata["raw_id_token"]?.stringValue, rawIDToken)
+    }
+
+    func testCodexAuthCacheWritesBaseCodexTokenShape() throws {
+        let idPayload: JSONValue = .object([
+            "https://api.openai.com/auth": .object([
+                "chatgpt_account_id": .string("acct_123")
+            ])
+        ])
+        let rawIDToken = try Self.fakeJWT(payload: idPayload)
+        let auth = CodexAuthDotJson(
+            authMode: "chatgpt",
+            openaiAPIKey: "sk-token-exchange",
+            tokens: CodexTokenData(
+                idToken: idPayload,
+                accessToken: "access",
+                refreshToken: "refresh",
+                accountID: "acct_123",
+                rawIDToken: rawIDToken
+            ),
+            lastRefresh: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+
+        let json = try JSONDecoder.codex.decode(JSONValue.self, from: JSONEncoder.codexPretty.encode(auth))
+        XCTAssertEqual(json["OPENAI_API_KEY"]?.stringValue, "sk-token-exchange")
+        XCTAssertEqual(json["tokens"]?["id_token"]?.stringValue, rawIDToken)
+        XCTAssertNil(json["tokens"]?["raw_id_token"])
+    }
+
     func testSHA256KnownVector() {
         let digest = SHA256.hash(Data("abc".utf8)).map { String(format: "%02x", $0) }.joined()
         XCTAssertEqual(digest, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
