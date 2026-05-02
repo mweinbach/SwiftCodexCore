@@ -1,0 +1,15 @@
+{
+  "originHash" : "867633ca14255e25acec4f847ccf49ebf10336d9e8b81c7fb232e457c7d433d9",
+  "pins" : [
+    {
+      "identity" : "just-bash-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/mweinbach/just-bash-swift",
+      "state" : {
+        "branch" : "main",
+        "revision" : "506b06a80a6c34cb944addcd48d6ba879b44313c"
+      }
+    }
+  ],
+  "version" : 3
+}
