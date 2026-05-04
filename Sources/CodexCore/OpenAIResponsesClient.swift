@@ -248,9 +248,19 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     }
 
     private static func parseJSONResponse(data: Data, continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation) throws {
+        if looksLikeSSE(data) {
+            try parseSSE(data: data, continuation: continuation)
+            return
+        }
         let json = try JSONDecoder.codex.decode(JSONValue.self, from: data)
         let events = try eventsFromResponseObject(json)
         for event in events { continuation.yield(event) }
+    }
+
+    private static func looksLikeSSE(_ data: Data) -> Bool {
+        guard let text = String(data: data, encoding: .utf8) else { return false }
+        let prefix = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return prefix.hasPrefix("event:") || prefix.hasPrefix("data:") || prefix.hasPrefix(":")
     }
 
     private static func parseResponseSnapshot(data: Data) throws -> OpenAIResponseSnapshot {

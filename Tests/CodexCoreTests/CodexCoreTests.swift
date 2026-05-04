@@ -298,6 +298,44 @@ final class CodexCoreTests: XCTestCase {
         _ = try await iterator.next()
     }
 
+    func testOpenAIResponsesClientParsesSSEBodyWithJSONContentType() async throws {
+        StubURLProtocol.handler = { request in
+            StubURLProtocol.response(
+                for: request,
+                contentType: "application/json",
+                body: """
+                event: response.output_text.delta
+                data: {"type":"response.output_text.delta","delta":"hewwo"}
+
+                event: response.completed
+                data: {"type":"response.completed","response":{"id":"resp_123"}}
+
+                """
+            )
+        }
+        defer { StubURLProtocol.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let client = OpenAIResponsesClient(
+            auth: StaticAuthProvider(),
+            options: OpenAIResponsesClient.Options(endpoint: URL(string: "https://chatgpt.test/backend-api/codex/responses")!),
+            session: session
+        )
+
+        let request = ResponsesRequest(model: "gpt-5.4", input: [ResponseInputBuilder.userMessage("hello")])
+        var events: [ModelStreamEvent] = []
+        for try await event in client.streamResponse(request) {
+            events.append(event)
+        }
+
+        XCTAssertEqual(events, [
+            .outputTextDelta("hewwo"),
+            .completed(responseID: "resp_123", usage: nil)
+        ])
+    }
+
     func testOpenAIResponsesClientBackgroundLifecycleUsesResponseEndpoints() async throws {
         let endpoint = URL(string: "https://example.test/v1/responses")!
         let requests = Locked<[CapturedHTTPRequest]>([])
@@ -759,13 +797,17 @@ private final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 
     static func response(for request: URLRequest, statusCode: Int = 200, json: String) -> (HTTPURLResponse, Data) {
+        response(for: request, statusCode: statusCode, contentType: "application/json", body: json)
+    }
+
+    static func response(for request: URLRequest, statusCode: Int = 200, contentType: String, body: String) -> (HTTPURLResponse, Data) {
         let response = HTTPURLResponse(
             url: request.url!,
             statusCode: statusCode,
             httpVersion: nil,
-            headerFields: ["Content-Type": "application/json"]
+            headerFields: ["Content-Type": contentType]
         )!
-        return (response, Data(json.utf8))
+        return (response, Data(body.utf8))
     }
 }
 
