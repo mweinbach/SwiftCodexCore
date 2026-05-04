@@ -150,6 +150,23 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
         self.metadata = metadata
         self.parallelToolCalls = parallelToolCalls
     }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(model, forKey: .model)
+        try container.encodeIfPresent(instructions, forKey: .instructions)
+        try container.encode(input, forKey: .input)
+        try container.encode(tools, forKey: .tools)
+        try container.encode(stream, forKey: .stream)
+        try container.encodeIfPresent(reasoning, forKey: .reasoning)
+        try container.encodeIfPresent(background, forKey: .background)
+        try container.encodeIfPresent(store, forKey: .store)
+        try container.encodeIfPresent(previousResponseID, forKey: .previousResponseID)
+        if !metadata.isEmpty {
+            try container.encode(metadata, forKey: .metadata)
+        }
+        try container.encodeIfPresent(parallelToolCalls, forKey: .parallelToolCalls)
+    }
 }
 
 public struct ResponseReasoning: Codable, Sendable, Equatable {

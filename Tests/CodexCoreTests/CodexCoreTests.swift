@@ -259,6 +259,45 @@ final class CodexCoreTests: XCTestCase {
         XCTAssertEqual(json["reasoning"]?["summary"]?.stringValue, "auto")
     }
 
+    func testResponsesRequestOmitsEmptyMetadata() throws {
+        let request = ResponsesRequest(
+            model: "gpt-5.4",
+            input: [ResponseInputBuilder.userMessage("hello")]
+        )
+
+        let json = try JSONDecoder.codex.decode(JSONValue.self, from: JSONEncoder.codexCompact.encode(request))
+        XCTAssertNil(json["metadata"])
+    }
+
+    func testChatGPTCodexBackendDoesNotSendTopLevelMetadata() async throws {
+        StubURLProtocol.handler = { request in
+            let body = try JSONDecoder.codex.decode(JSONValue.self, from: request.bodyData())
+            XCTAssertNil(body["metadata"])
+            return StubURLProtocol.response(for: request, json: #"{"output_text":"ok"}"#)
+        }
+        defer { StubURLProtocol.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let client = OpenAIResponsesClient(
+            auth: StaticAuthProvider(),
+            options: OpenAIResponsesClient.Options(
+                endpoint: URL(string: "https://chatgpt.test/backend-api/codex/responses")!,
+                sendsMetadata: false
+            ),
+            session: session
+        )
+        let request = ResponsesRequest(
+            model: "gpt-5.4",
+            input: [ResponseInputBuilder.userMessage("hello")],
+            metadata: ["thread_id": .string("thread_123")]
+        )
+
+        var iterator = client.streamResponse(request).makeAsyncIterator()
+        _ = try await iterator.next()
+    }
+
     func testOpenAIResponsesClientBackgroundLifecycleUsesResponseEndpoints() async throws {
         let endpoint = URL(string: "https://example.test/v1/responses")!
         let requests = Locked<[CapturedHTTPRequest]>([])

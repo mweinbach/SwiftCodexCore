@@ -8,21 +8,27 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         public var endpoint: URL
         public var extraHeaders: [String: String]
         public var requestTimeout: TimeInterval
+        public var sendsMetadata: Bool
 
         public init(
             endpoint: URL = URL(string: "https://api.openai.com/v1/responses")!,
             extraHeaders: [String: String] = [:],
-            requestTimeout: TimeInterval = 600
+            requestTimeout: TimeInterval = 600,
+            sendsMetadata: Bool = true
         ) {
             self.endpoint = endpoint
             self.extraHeaders = extraHeaders
             self.requestTimeout = requestTimeout
+            self.sendsMetadata = sendsMetadata
         }
 
         public static var openAIPlatform: Options { Options(endpoint: URL(string: "https://api.openai.com/v1/responses")!) }
 
         public static var chatGPTCodexBackend: Options {
-            Options(endpoint: URL(string: "https://chatgpt.com/backend-api/codex/responses")!)
+            Options(
+                endpoint: URL(string: "https://chatgpt.com/backend-api/codex/responses")!,
+                sendsMetadata: false
+            )
         }
     }
 
@@ -131,7 +137,11 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     }
 
     private func makeURLRequest(_ request: ResponsesRequest) async throws -> URLRequest {
-        try await makeURLRequest(
+        var request = request
+        if !options.sendsMetadata {
+            request.metadata = [:]
+        }
+        return try await makeURLRequest(
             method: "POST",
             url: options.endpoint,
             body: JSONEncoder.codexCompact.encode(request),
