@@ -153,6 +153,7 @@ public final class CodexAgent: Sendable {
 
             let localToolDefinitions = await toolRegistry.listDefinitions().map(\.responseTool)
             let toolDefinitions = toolsAllowedBySandbox(localToolDefinitions + configuration.serverTools)
+            let useResponseContinuation = nextInputUsesPreviousResponse && modelProvider.supportsResponseContinuation
             let request = ResponsesRequest(
                 model: configuration.model,
                 instructions: promptAssembly.instructions,
@@ -161,7 +162,7 @@ public final class CodexAgent: Sendable {
                 stream: true,
                 reasoning: ResponseReasoning(effort: configuration.reasoningEffort, summary: configuration.reasoningSummary),
                 store: false,
-                previousResponseID: nextInputUsesPreviousResponse ? lastResponseID : nil,
+                previousResponseID: useResponseContinuation ? lastResponseID : nil,
                 metadata: ["thread_id": .string(threadID), "turn_id": .string(turnID), "iteration": .number(Double(iteration))],
                 parallelToolCalls: true
             )
@@ -293,7 +294,7 @@ public final class CodexAgent: Sendable {
                     continuation.yield(.itemCompleted(resultItem))
                     toolOutputs.append(ResponseInputBuilder.functionCallOutput(callID: call.callID, output: result.content))
                 }
-                if lastResponseID != nil {
+                if lastResponseID != nil && modelProvider.supportsResponseContinuation {
                     responseInputs = toolOutputs
                     nextInputUsesPreviousResponse = true
                 } else {

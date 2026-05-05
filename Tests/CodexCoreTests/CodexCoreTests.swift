@@ -217,6 +217,35 @@ final class CodexCoreTests: XCTestCase {
         XCTAssertEqual(provider.requests[1].input.first?["type"]?.stringValue, "function_call_output")
     }
 
+    func testToolContinuationReplaysHistoryWhenProviderDoesNotSupportPreviousResponseID() async throws {
+        let provider = RecordingModelProvider(
+            batches: [
+                [
+                    .toolCallCompleted(ToolCall(callID: "call_echo", name: "echo", arguments: #"{"text":"pong"}"#)),
+                    .completed(responseID: "r1", usage: nil)
+                ],
+                [
+                    .outputTextDelta("pong"),
+                    .completed(responseID: "r2", usage: nil)
+                ]
+            ],
+            supportsResponseContinuation: false
+        )
+        let agent = CodexAgent(modelProvider: provider, toolRegistry: ToolRegistry(tools: [EchoTool()]), threadManager: ThreadManager(store: InMemoryThreadStore()))
+        let thread = try await agent.createThread()
+        let handle = agent.startTurn(threadID: thread.id, input: TurnInput("ping"))
+        for try await _ in handle.events {}
+
+        XCTAssertEqual(provider.requests.count, 2)
+        XCTAssertNil(provider.requests[0].previousResponseID)
+        XCTAssertNil(provider.requests[1].previousResponseID)
+        XCTAssertGreaterThanOrEqual(provider.requests[1].input.count, 3)
+        XCTAssertEqual(provider.requests[1].input[0]["role"]?.stringValue, "user")
+        let itemTypes = provider.requests[1].input.compactMap { $0["type"]?.stringValue }
+        XCTAssertTrue(itemTypes.contains("function_call"))
+        XCTAssertTrue(itemTypes.contains("function_call_output"))
+    }
+
     func testThreadForkRollback() async throws {
         let manager = ThreadManager(store: InMemoryThreadStore())
         let thread = try await manager.createThread(title: "root")
@@ -273,6 +302,7 @@ final class CodexCoreTests: XCTestCase {
         StubURLProtocol.handler = { request in
             let body = try JSONDecoder.codex.decode(JSONValue.self, from: request.bodyData())
             XCTAssertNil(body["metadata"])
+            XCTAssertNil(body["previous_response_id"])
             return StubURLProtocol.response(for: request, json: #"{"output_text":"ok"}"#)
         }
         defer { StubURLProtocol.handler = nil }
@@ -284,13 +314,15 @@ final class CodexCoreTests: XCTestCase {
             auth: StaticAuthProvider(),
             options: OpenAIResponsesClient.Options(
                 endpoint: URL(string: "https://chatgpt.test/backend-api/codex/responses")!,
-                sendsMetadata: false
+                sendsMetadata: false,
+                supportsResponseContinuation: false
             ),
             session: session
         )
         let request = ResponsesRequest(
             model: "gpt-5.4",
             input: [ResponseInputBuilder.userMessage("hello")],
+            previousResponseID: "resp_123",
             metadata: ["thread_id": .string("thread_123")]
         )
 
@@ -671,9 +703,11 @@ private final class RecordingModelProvider: ModelProvider, @unchecked Sendable {
     private let lock = NSLock()
     private var batches: [[ModelStreamEvent]]
     private var storage: [ResponsesRequest] = []
+    let supportsResponseContinuation: Bool
 
-    init(batches: [[ModelStreamEvent]]) {
+    init(batches: [[ModelStreamEvent]], supportsResponseContinuation: Bool = true) {
         self.batches = batches
+        self.supportsResponseContinuation = supportsResponseContinuation
     }
 
     var requests: [ResponsesRequest] {

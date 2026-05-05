@@ -9,17 +9,20 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         public var extraHeaders: [String: String]
         public var requestTimeout: TimeInterval
         public var sendsMetadata: Bool
+        public var supportsResponseContinuation: Bool
 
         public init(
             endpoint: URL = URL(string: "https://api.openai.com/v1/responses")!,
             extraHeaders: [String: String] = [:],
             requestTimeout: TimeInterval = 600,
-            sendsMetadata: Bool = true
+            sendsMetadata: Bool = true,
+            supportsResponseContinuation: Bool = true
         ) {
             self.endpoint = endpoint
             self.extraHeaders = extraHeaders
             self.requestTimeout = requestTimeout
             self.sendsMetadata = sendsMetadata
+            self.supportsResponseContinuation = supportsResponseContinuation
         }
 
         public static var openAIPlatform: Options { Options(endpoint: URL(string: "https://api.openai.com/v1/responses")!) }
@@ -27,7 +30,8 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         public static var chatGPTCodexBackend: Options {
             Options(
                 endpoint: URL(string: "https://chatgpt.com/backend-api/codex/responses")!,
-                sendsMetadata: false
+                sendsMetadata: false,
+                supportsResponseContinuation: false
             )
         }
     }
@@ -40,6 +44,10 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         self.auth = auth
         self.options = options
         self.session = session
+    }
+
+    public var supportsResponseContinuation: Bool {
+        options.supportsResponseContinuation
     }
 
     /// Sends a Responses request and yields canonical model events as bytes arrive.
@@ -140,6 +148,9 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         var request = request
         if !options.sendsMetadata {
             request.metadata = [:]
+        }
+        if !options.supportsResponseContinuation {
+            request.previousResponseID = nil
         }
         return try await makeURLRequest(
             method: "POST",

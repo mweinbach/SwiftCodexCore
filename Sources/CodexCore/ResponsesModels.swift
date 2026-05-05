@@ -236,7 +236,13 @@ public enum ModelStreamEvent: Sendable, Equatable {
 }
 
 public protocol ModelProvider: Sendable {
+    var supportsResponseContinuation: Bool { get }
+
     func streamResponse(_ request: ResponsesRequest) -> AsyncThrowingStream<ModelStreamEvent, Error>
+}
+
+public extension ModelProvider {
+    var supportsResponseContinuation: Bool { true }
 }
 
 public enum ResponseInputBuilder {
