@@ -308,4 +308,13 @@ public enum ResponseInputBuilder {
     public static func serverToolOutput(_ item: JSONValue) -> JSONValue {
         item
     }
+
+    public static func replayableServerToolOutput(_ item: JSONValue) -> JSONValue? {
+        switch item["type"]?.stringValue {
+        case "web_search_call", "image_generation_call":
+            return item
+        default:
+            return nil
+        }
+    }
 }

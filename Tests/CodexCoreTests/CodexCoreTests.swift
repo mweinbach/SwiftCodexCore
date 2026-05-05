@@ -246,6 +246,47 @@ final class CodexCoreTests: XCTestCase {
         XCTAssertTrue(itemTypes.contains("function_call_output"))
     }
 
+    func testHostedToolReplaySkipsProgressEvents() async throws {
+        let provider = RecordingModelProvider(
+            batches: [
+                [
+                    .serverToolCompleted(
+                        name: "web_search",
+                        item: .object([
+                            "item_id": .string("ws_progress"),
+                            "type": .string("response.web_search_call.completed")
+                        ])
+                    ),
+                    .serverToolCompleted(
+                        name: "web_search",
+                        item: .object([
+                            "id": .string("ws_final"),
+                            "status": .string("completed"),
+                            "type": .string("web_search_call")
+                        ])
+                    ),
+                    .outputTextDelta("market brief"),
+                    .completed(responseID: "r1", usage: nil)
+                ],
+                [
+                    .outputTextDelta("doc created"),
+                    .completed(responseID: "r2", usage: nil)
+                ]
+            ],
+            supportsResponseContinuation: false
+        )
+        let agent = CodexAgent(modelProvider: provider, threadManager: ThreadManager(store: InMemoryThreadStore()))
+        let thread = try await agent.createThread()
+
+        for try await _ in agent.startTurn(threadID: thread.id, input: TurnInput("research pc market")).events {}
+        for try await _ in agent.startTurn(threadID: thread.id, input: TurnInput("write a report")).events {}
+
+        XCTAssertEqual(provider.requests.count, 2)
+        let replayedTypes = provider.requests[1].input.compactMap { $0["type"]?.stringValue }
+        XCTAssertTrue(replayedTypes.contains("web_search_call"))
+        XCTAssertFalse(replayedTypes.contains("response.web_search_call.completed"))
+    }
+
     func testThreadForkRollback() async throws {
         let manager = ThreadManager(store: InMemoryThreadStore())
         let thread = try await manager.createThread(title: "root")

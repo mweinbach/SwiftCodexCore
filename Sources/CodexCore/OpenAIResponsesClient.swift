@@ -310,9 +310,11 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
             }
             return [.raw(json)]
         case "response.web_search_call.completed", "response.web_search_call.done":
-            return [.serverToolCompleted(name: "web_search", item: json["item"] ?? json)]
+            guard let item = json["item"], ResponseInputBuilder.replayableServerToolOutput(item) != nil else { return [] }
+            return [.serverToolCompleted(name: "web_search", item: item)]
         case "response.image_generation_call.completed", "response.image_generation_call.done":
-            return [.serverToolCompleted(name: "image_generation", item: json["item"] ?? json)]
+            guard let item = json["item"], ResponseInputBuilder.replayableServerToolOutput(item) != nil else { return [] }
+            return [.serverToolCompleted(name: "image_generation", item: item)]
         case "response.completed":
             let response = json["response"]
             let responseID = response?["id"]?.stringValue

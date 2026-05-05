@@ -352,7 +352,10 @@ public final class CodexAgent: Sendable {
                     input.append(ResponseInputBuilder.functionCallOutput(callID: callID, output: content))
                 }
             case .webSearch, .imageGeneration:
-                if let item = item.payload["item"] { input.append(ResponseInputBuilder.serverToolOutput(item)) }
+                if let item = item.payload["item"],
+                   let replayableItem = ResponseInputBuilder.replayableServerToolOutput(item) {
+                    input.append(replayableItem)
+                }
             default:
                 continue
             }
