@@ -294,14 +294,13 @@ public enum ResponseInputBuilder {
         ])
     }
 
-    public static func injectedUserInstructions(title: String, body: String, metadata: [String: JSONValue] = [:]) -> JSONValue {
+    public static func injectedUserInstructions(title: String, body: String, metadata _: [String: JSONValue] = [:]) -> JSONValue {
         .object([
             "role": .string("user"),
             "content": .array([.object([
                 "type": .string("input_text"),
                 "text": .string("# \(title)\n\n<INSTRUCTIONS>\n\(body)\n</INSTRUCTIONS>")
-            ])]),
-            "metadata": .object(metadata)
+            ])])
         ])
     }
 

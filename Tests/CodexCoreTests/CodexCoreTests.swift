@@ -545,6 +545,7 @@ final class CodexCoreTests: XCTestCase {
         let prefixText = assembly.inputPrefixItems.map(\.description).joined(separator: "\n")
         XCTAssertTrue(prefixText.contains("Run swift test"))
         XCTAssertTrue(prefixText.contains("Always include completed work"))
+        XCTAssertTrue(assembly.inputPrefixItems.allSatisfy { $0["metadata"] == nil })
     }
 
     func testEmbeddedSkillsMaterializeAndActivateThroughNormalRegistry() throws {
