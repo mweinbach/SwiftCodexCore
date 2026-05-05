@@ -221,7 +221,7 @@ final class CodexCoreTests: XCTestCase {
         let provider = RecordingModelProvider(
             batches: [
                 [
-                    .toolCallCompleted(ToolCall(callID: "call_echo", name: "echo", arguments: #"{"text":"pong"}"#)),
+                    .toolCallCompleted(ToolCall(id: "fc_echo", callID: "call_echo", name: "echo", arguments: #"{"text":"pong"}"#)),
                     .completed(responseID: "r1", usage: nil)
                 ],
                 [
@@ -244,6 +244,9 @@ final class CodexCoreTests: XCTestCase {
         let itemTypes = provider.requests[1].input.compactMap { $0["type"]?.stringValue }
         XCTAssertTrue(itemTypes.contains("function_call"))
         XCTAssertTrue(itemTypes.contains("function_call_output"))
+        let replayedToolCall = try XCTUnwrap(provider.requests[1].input.first { $0["type"]?.stringValue == "function_call" })
+        XCTAssertEqual(replayedToolCall["id"]?.stringValue, "fc_echo")
+        XCTAssertEqual(replayedToolCall["call_id"]?.stringValue, "call_echo")
     }
 
     func testHostedToolReplaySkipsProgressEvents() async throws {

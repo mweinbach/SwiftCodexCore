@@ -241,6 +241,7 @@ public final class CodexAgent: Sendable {
                 var toolOutputs: [JSONValue] = []
                 for call in toolCalls {
                     let callItem = ThreadItem(
+                        id: call.id,
                         threadID: threadID,
                         turnID: turnID,
                         kind: call.name.hasPrefix("mcp__") ? .mcpToolCall : .toolCall,
