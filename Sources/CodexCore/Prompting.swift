@@ -161,7 +161,7 @@ Tool-loop contract:
 """
 
     public static let skillCatalogHeader = """
-Available skills are listed below. Each skill has a name, description, and SKILL.md path. Mention a skill explicitly with `$skill-name`, or select one implicitly when the task matches its description. Load and follow full skill instructions only for activated skills.
+Available skills are listed below. Each skill has a name and description. Mention a skill explicitly with `$skill-name`, or select one implicitly when the task matches its description. Load and follow full skill instructions only for activated skills.
 """
 }
 
@@ -408,7 +408,7 @@ public enum SkillRegistry {
         var lines: [String] = []
         var used = 0
         for skill in skills {
-            var line = "- $\(skill.name): \(skill.description) (\(skill.path.path))"
+            var line = "- $\(skill.name): \(skill.description)"
             let remaining = maxCharacters - used
             guard remaining > 0 else { break }
             if line.count > remaining {

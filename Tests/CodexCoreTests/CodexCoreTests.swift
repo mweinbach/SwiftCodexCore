@@ -538,6 +538,8 @@ final class CodexCoreTests: XCTestCase {
         )
         let assembly = try PromptAssembler.build(configuration: config, userText: "$report-writer summarize this change")
         XCTAssertTrue(assembly.instructions.contains("$report-writer"))
+        XCTAssertFalse(assembly.instructions.contains(skillDir.path))
+        XCTAssertFalse(assembly.instructions.contains("SKILL.md path"))
         XCTAssertEqual(assembly.projectInstructions.count, 1)
         XCTAssertEqual(assembly.activatedSkills.map(\.name), ["report-writer"])
         let prefixText = assembly.inputPrefixItems.map(\.description).joined(separator: "\n")
