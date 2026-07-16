@@ -4,6 +4,10 @@ public struct ToolDefinition: Codable, Sendable, Equatable {
     public var name: String
     public var description: String
     public var parameters: JSONValue
+    public var strict: Bool?
+    public var outputSchema: JSONValue?
+    public var allowedCallers: [ResponseToolCaller]?
+    public var deferLoading: Bool?
     public var requiresApproval: Bool
     public var isStateChanging: Bool
 
@@ -11,18 +15,34 @@ public struct ToolDefinition: Codable, Sendable, Equatable {
         name: String,
         description: String,
         parameters: JSONValue,
+        strict: Bool? = nil,
+        outputSchema: JSONValue? = nil,
+        allowedCallers: [ResponseToolCaller]? = nil,
+        deferLoading: Bool? = nil,
         requiresApproval: Bool = false,
         isStateChanging: Bool = false
     ) {
         self.name = name
         self.description = description
         self.parameters = parameters
+        self.strict = strict
+        self.outputSchema = outputSchema
+        self.allowedCallers = allowedCallers
+        self.deferLoading = deferLoading
         self.requiresApproval = requiresApproval
         self.isStateChanging = isStateChanging
     }
 
     public var responseTool: ResponseToolDefinition {
-        ResponseToolDefinition(name: name, description: description, parameters: parameters)
+        ResponseToolDefinition(
+            name: name,
+            description: description,
+            parameters: parameters,
+            strict: strict,
+            outputSchema: outputSchema,
+            allowedCallers: allowedCallers,
+            deferLoading: deferLoading
+        )
     }
 }
 

@@ -152,12 +152,20 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         if !options.supportsResponseContinuation {
             request.previousResponseID = nil
         }
-        return try await makeURLRequest(
+        var urlRequest = try await makeURLRequest(
             method: "POST",
             url: options.endpoint,
             body: JSONEncoder.codexCompact.encode(request),
             accept: "text/event-stream, application/json"
         )
+        if request.multiAgent?.enabled == true {
+            let beta = "responses_multi_agent=v1"
+            let current = urlRequest.value(forHTTPHeaderField: "OpenAI-Beta") ?? ""
+            if !current.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }).contains(beta) {
+                urlRequest.setValue(current.isEmpty ? beta : "\(current), \(beta)", forHTTPHeaderField: "OpenAI-Beta")
+            }
+        }
+        return urlRequest
     }
 
     private func sendData(method: String, url: URL, body: Data?, accept: String, allowRefresh: Bool) async throws -> Data {
@@ -377,7 +385,8 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
             callID: callID,
             name: name,
             arguments: arguments,
-            rawArguments: rawArguments
+            rawArguments: rawArguments,
+            caller: item["caller"]
         )
     }
 
@@ -426,6 +435,17 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
             guard let double = object[key]?.doubleValue else { return nil }
             return Int(double)
         }
-        return TokenUsage(inputTokens: int("input_tokens"), outputTokens: int("output_tokens"), totalTokens: int("total_tokens"))
+        func nestedInt(_ objectKey: String, _ valueKey: String) -> Int? {
+            guard let double = object[objectKey]?[valueKey]?.doubleValue else { return nil }
+            return Int(double)
+        }
+        return TokenUsage(
+            inputTokens: int("input_tokens"),
+            outputTokens: int("output_tokens"),
+            totalTokens: int("total_tokens"),
+            cachedInputTokens: nestedInt("input_tokens_details", "cached_tokens"),
+            cacheWriteTokens: int("cache_write_tokens") ?? nestedInt("input_tokens_details", "cache_write_tokens"),
+            reasoningOutputTokens: nestedInt("output_tokens_details", "reasoning_tokens")
+        )
     }
 }

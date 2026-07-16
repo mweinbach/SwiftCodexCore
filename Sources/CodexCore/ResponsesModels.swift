@@ -1,5 +1,17 @@
 import Foundation
 
+public enum ResponseToolCaller: String, Codable, Sendable, Equatable, CaseIterable {
+    case direct
+    case programmatic
+}
+
+public enum ImageDetail: String, Codable, Sendable, Equatable, CaseIterable {
+    case low
+    case high
+    case original
+    case auto
+}
+
 public struct ResponseToolDefinition: Codable, Sendable, Equatable {
     public var fields: [String: JSONValue]
 
@@ -20,13 +32,26 @@ public struct ResponseToolDefinition: Codable, Sendable, Equatable {
         self.fields = fields
     }
 
-    public init(name: String, description: String, parameters: JSONValue) {
-        self.fields = [
+    public init(
+        name: String,
+        description: String,
+        parameters: JSONValue,
+        strict: Bool? = nil,
+        outputSchema: JSONValue? = nil,
+        allowedCallers: [ResponseToolCaller]? = nil,
+        deferLoading: Bool? = nil
+    ) {
+        var fields: [String: JSONValue] = [
             "type": .string("function"),
             "name": .string(name),
             "description": .string(description),
             "parameters": parameters
         ]
+        if let strict { fields["strict"] = .bool(strict) }
+        if let outputSchema { fields["output_schema"] = outputSchema }
+        if let allowedCallers { fields["allowed_callers"] = .array(allowedCallers.map { .string($0.rawValue) }) }
+        if let deferLoading { fields["defer_loading"] = .bool(deferLoading) }
+        self.fields = fields
     }
 
     public init(type: String, options: [String: JSONValue] = [:]) {
@@ -85,7 +110,60 @@ public struct ResponseToolDefinition: Codable, Sendable, Equatable {
         return ResponseToolDefinition(type: "image_generation", options: options)
     }
 
-    public static func remoteMCP(serverLabel: String, serverURL: URL, requireApproval: String? = nil, headers: [String: String] = [:]) -> ResponseToolDefinition {
+    public static func fileSearch(vectorStoreIDs: [String], maxNumberOfResults: Int? = nil, filters: JSONValue? = nil) -> ResponseToolDefinition {
+        var options: [String: JSONValue] = [
+            "vector_store_ids": .array(vectorStoreIDs.map(JSONValue.string))
+        ]
+        if let maxNumberOfResults { options["max_num_results"] = .number(Double(maxNumberOfResults)) }
+        if let filters { options["filters"] = filters }
+        return ResponseToolDefinition(type: "file_search", options: options)
+    }
+
+    public static func codeInterpreter(container: JSONValue? = nil, allowedCallers: [ResponseToolCaller]? = nil) -> ResponseToolDefinition {
+        var options: [String: JSONValue] = [:]
+        if let container { options["container"] = container }
+        if let allowedCallers { options["allowed_callers"] = .array(allowedCallers.map { .string($0.rawValue) }) }
+        return ResponseToolDefinition(type: "code_interpreter", options: options)
+    }
+
+    public static func hostedShell(allowedCallers: [ResponseToolCaller]? = nil) -> ResponseToolDefinition {
+        var options: [String: JSONValue] = [:]
+        if let allowedCallers { options["allowed_callers"] = .array(allowedCallers.map { .string($0.rawValue) }) }
+        return ResponseToolDefinition(type: "shell", options: options)
+    }
+
+    public static func applyPatch(allowedCallers: [ResponseToolCaller]? = nil) -> ResponseToolDefinition {
+        var options: [String: JSONValue] = [:]
+        if let allowedCallers { options["allowed_callers"] = .array(allowedCallers.map { .string($0.rawValue) }) }
+        return ResponseToolDefinition(type: "apply_patch", options: options)
+    }
+
+    public static func computerUse(environment: String? = nil) -> ResponseToolDefinition {
+        var options: [String: JSONValue] = [:]
+        if let environment { options["environment"] = .string(environment) }
+        return ResponseToolDefinition(type: "computer", options: options)
+    }
+
+    public static func skills() -> ResponseToolDefinition {
+        ResponseToolDefinition(type: "skills")
+    }
+
+    public static func toolSearch() -> ResponseToolDefinition {
+        ResponseToolDefinition(type: "tool_search")
+    }
+
+    public static func programmaticToolCalling() -> ResponseToolDefinition {
+        ResponseToolDefinition(type: "programmatic_tool_calling")
+    }
+
+    public static func remoteMCP(
+        serverLabel: String,
+        serverURL: URL,
+        requireApproval: String? = nil,
+        headers: [String: String] = [:],
+        allowedCallers: [ResponseToolCaller]? = nil,
+        deferLoading: Bool? = nil
+    ) -> ResponseToolDefinition {
         var options: [String: JSONValue] = [
             "server_label": .string(serverLabel),
             "server_url": .string(serverURL.absoluteString)
@@ -94,7 +172,25 @@ public struct ResponseToolDefinition: Codable, Sendable, Equatable {
         if !headers.isEmpty {
             options["headers"] = .object(headers.mapValues(JSONValue.string))
         }
+        if let allowedCallers { options["allowed_callers"] = .array(allowedCallers.map { .string($0.rawValue) }) }
+        if let deferLoading { options["defer_loading"] = .bool(deferLoading) }
         return ResponseToolDefinition(type: "mcp", options: options)
+    }
+}
+
+public enum ResponseVerbosity: String, Codable, Sendable, Equatable, CaseIterable {
+    case low
+    case medium
+    case high
+}
+
+public struct ResponseTextOptions: Codable, Sendable, Equatable {
+    public var verbosity: ResponseVerbosity?
+    public var format: JSONValue?
+
+    public init(verbosity: ResponseVerbosity? = nil, format: JSONValue? = nil) {
+        self.verbosity = verbosity
+        self.format = format
     }
 }
 
@@ -110,6 +206,15 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
     public var previousResponseID: String?
     public var metadata: [String: JSONValue]
     public var parallelToolCalls: Bool?
+    public var include: [String]?
+    public var serviceTier: String?
+    public var promptCacheKey: String?
+    public var promptCacheOptions: PromptCacheOptions?
+    public var safetyIdentifier: String?
+    public var maxOutputTokens: Int?
+    public var toolChoice: JSONValue?
+    public var text: ResponseTextOptions?
+    public var multiAgent: MultiAgentConfiguration?
 
     enum CodingKeys: String, CodingKey {
         case model
@@ -123,6 +228,15 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
         case previousResponseID = "previous_response_id"
         case metadata
         case parallelToolCalls = "parallel_tool_calls"
+        case include
+        case serviceTier = "service_tier"
+        case promptCacheKey = "prompt_cache_key"
+        case promptCacheOptions = "prompt_cache_options"
+        case safetyIdentifier = "safety_identifier"
+        case maxOutputTokens = "max_output_tokens"
+        case toolChoice = "tool_choice"
+        case text
+        case multiAgent = "multi_agent"
     }
 
     public init(
@@ -136,7 +250,16 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
         store: Bool? = nil,
         previousResponseID: String? = nil,
         metadata: [String: JSONValue] = [:],
-        parallelToolCalls: Bool? = true
+        parallelToolCalls: Bool? = true,
+        include: [String]? = nil,
+        serviceTier: String? = nil,
+        promptCacheKey: String? = nil,
+        promptCacheOptions: PromptCacheOptions? = nil,
+        safetyIdentifier: String? = nil,
+        maxOutputTokens: Int? = nil,
+        toolChoice: JSONValue? = nil,
+        text: ResponseTextOptions? = nil,
+        multiAgent: MultiAgentConfiguration? = nil
     ) {
         self.model = model
         self.instructions = instructions
@@ -149,6 +272,15 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
         self.previousResponseID = previousResponseID
         self.metadata = metadata
         self.parallelToolCalls = parallelToolCalls
+        self.include = include
+        self.serviceTier = serviceTier
+        self.promptCacheKey = promptCacheKey
+        self.promptCacheOptions = promptCacheOptions
+        self.safetyIdentifier = safetyIdentifier
+        self.maxOutputTokens = maxOutputTokens
+        self.toolChoice = toolChoice
+        self.text = text
+        self.multiAgent = multiAgent
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -166,23 +298,38 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
             try container.encode(metadata, forKey: .metadata)
         }
         try container.encodeIfPresent(parallelToolCalls, forKey: .parallelToolCalls)
+        try container.encodeIfPresent(include, forKey: .include)
+        try container.encodeIfPresent(serviceTier, forKey: .serviceTier)
+        try container.encodeIfPresent(promptCacheKey, forKey: .promptCacheKey)
+        try container.encodeIfPresent(promptCacheOptions, forKey: .promptCacheOptions)
+        try container.encodeIfPresent(safetyIdentifier, forKey: .safetyIdentifier)
+        try container.encodeIfPresent(maxOutputTokens, forKey: .maxOutputTokens)
+        try container.encodeIfPresent(toolChoice, forKey: .toolChoice)
+        try container.encodeIfPresent(text, forKey: .text)
+        try container.encodeIfPresent(multiAgent, forKey: .multiAgent)
     }
 }
 
 public struct ResponseReasoning: Codable, Sendable, Equatable {
     public var effort: String?
     public var summary: String?
+    public var mode: String?
+    public var context: String?
 
-    public init(effort: String? = nil, summary: String? = nil) {
+    public init(effort: String? = nil, summary: String? = nil, mode: String? = nil, context: String? = nil) {
         self.effort = effort
         self.summary = summary
+        self.mode = mode
+        self.context = context
     }
 
-    public init?(effort: ReasoningEffort?, summary: ReasoningSummary?) {
+    public init?(effort: ReasoningEffort?, summary: ReasoningSummary?, mode: ReasoningMode? = nil, context: ReasoningContext? = nil) {
         let summaryValue = summary == ReasoningSummary.none ? nil : summary?.rawValue
-        guard effort != nil || summaryValue != nil else { return nil }
+        guard effort != nil || summaryValue != nil || mode != nil || context != nil else { return nil }
         self.effort = effort?.rawValue
         self.summary = summaryValue
+        self.mode = mode?.rawValue
+        self.context = context?.rawValue
     }
 }
 
@@ -247,13 +394,46 @@ public extension ModelProvider {
 
 public enum ResponseInputBuilder {
     public static func userMessage(_ text: String) -> JSONValue {
+        userMessage(content: [inputText(text)])
+    }
+
+    public static func userMessage(content: [JSONValue]) -> JSONValue {
         .object([
             "role": .string("user"),
-            "content": .array([.object([
-                "type": .string("input_text"),
-                "text": .string(text)
-            ])])
+            "content": .array(content)
         ])
+    }
+
+    public static func inputText(_ text: String, cacheBreakpoint: Bool = false) -> JSONValue {
+        var fields: [String: JSONValue] = [
+            "type": .string("input_text"),
+            "text": .string(text)
+        ]
+        if cacheBreakpoint { fields["prompt_cache_breakpoint"] = explicitCacheBreakpoint }
+        return .object(fields)
+    }
+
+    public static func inputImage(url: URL, detail: ImageDetail = .auto, cacheBreakpoint: Bool = false) -> JSONValue {
+        inputImage(urlString: url.absoluteString, detail: detail, cacheBreakpoint: cacheBreakpoint)
+    }
+
+    public static func inputImage(urlString: String, detail: ImageDetail = .auto, cacheBreakpoint: Bool = false) -> JSONValue {
+        var fields: [String: JSONValue] = [
+            "type": .string("input_image"),
+            "image_url": .string(urlString),
+            "detail": .string(detail.rawValue)
+        ]
+        if cacheBreakpoint { fields["prompt_cache_breakpoint"] = explicitCacheBreakpoint }
+        return .object(fields)
+    }
+
+    public static func inputFile(fileID: String, cacheBreakpoint: Bool = false) -> JSONValue {
+        var fields: [String: JSONValue] = [
+            "type": .string("input_file"),
+            "file_id": .string(fileID)
+        ]
+        if cacheBreakpoint { fields["prompt_cache_breakpoint"] = explicitCacheBreakpoint }
+        return .object(fields)
     }
 
     public static func assistantMessage(_ text: String) -> JSONValue {
@@ -277,21 +457,25 @@ public enum ResponseInputBuilder {
     }
 
     public static func functionCall(_ call: ToolCall) -> JSONValue {
-        .object([
+        var fields: [String: JSONValue] = [
             "type": .string("function_call"),
             "id": .string(call.id),
             "call_id": .string(call.callID),
             "name": .string(call.name),
             "arguments": .string(call.arguments)
-        ])
+        ]
+        if let caller = call.caller { fields["caller"] = caller }
+        return .object(fields)
     }
 
-    public static func functionCallOutput(callID: String, output: String) -> JSONValue {
-        .object([
+    public static func functionCallOutput(callID: String, output: String, caller: JSONValue? = nil) -> JSONValue {
+        var fields: [String: JSONValue] = [
             "type": .string("function_call_output"),
             "call_id": .string(callID),
             "output": .string(output)
-        ])
+        ]
+        if let caller { fields["caller"] = caller }
+        return .object(fields)
     }
 
     public static func injectedUserInstructions(title: String, body: String, metadata _: [String: JSONValue] = [:]) -> JSONValue {
@@ -310,10 +494,14 @@ public enum ResponseInputBuilder {
 
     public static func replayableServerToolOutput(_ item: JSONValue) -> JSONValue? {
         switch item["type"]?.stringValue {
-        case "web_search_call", "image_generation_call":
+        case "web_search_call", "image_generation_call", "file_search_call", "computer_call",
+             "code_interpreter_call", "shell_call", "apply_patch_call", "mcp_call", "tool_search_call",
+             "program", "program_output", "reasoning", "multi_agent_call":
             return item
         default:
             return nil
         }
     }
+
+    private static let explicitCacheBreakpoint: JSONValue = .object(["mode": .string("explicit")])
 }

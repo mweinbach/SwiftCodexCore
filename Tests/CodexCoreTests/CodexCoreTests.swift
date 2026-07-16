@@ -305,13 +305,101 @@ final class CodexCoreTests: XCTestCase {
     func testResponseBuiltInToolDefinitionsEncode() throws {
         let tools: [ResponseToolDefinition] = [
             .webSearch(searchContextSize: "medium", externalWebAccess: true),
-            .imageGeneration(model: "gpt-image-2", size: "1024x1024", outputFormat: "png")
+            .imageGeneration(model: "gpt-image-2", size: "1024x1024", outputFormat: "png"),
+            .fileSearch(vectorStoreIDs: ["vs_123"]),
+            .codeInterpreter(allowedCallers: [.programmatic]),
+            .hostedShell(allowedCallers: [.direct, .programmatic]),
+            .applyPatch(),
+            .computerUse(environment: "computer"),
+            .skills(),
+            .toolSearch(),
+            .programmaticToolCalling()
         ]
         let data = try JSONEncoder.codexCompact.encode(tools)
         let json = String(data: data, encoding: .utf8) ?? ""
         XCTAssertTrue(json.contains("\"type\":\"web_search\""))
         XCTAssertTrue(json.contains("\"type\":\"image_generation\""))
         XCTAssertTrue(json.contains("\"external_web_access\":true"))
+        XCTAssertTrue(json.contains("\"type\":\"programmatic_tool_calling\""))
+        XCTAssertTrue(json.contains("\"allowed_callers\":[\"programmatic\"]"))
+    }
+
+    func testGPT56CapabilitiesAndRequestControlsEncode() throws {
+        let capabilities = try XCTUnwrap(OpenAIModelCapabilities.gpt56Family[.gpt56Sol])
+        XCTAssertEqual(capabilities.contextWindow, 1_050_000)
+        XCTAssertEqual(capabilities.maxOutputTokens, 128_000)
+        XCTAssertEqual(capabilities.supportedReasoningEfforts, [.none, .low, .medium, .high, .xhigh, .max])
+
+        let request = ResponsesRequest(
+            model: OpenAIModel.gpt56Sol.rawValue,
+            input: [ResponseInputBuilder.userMessage(content: [
+                ResponseInputBuilder.inputText("inspect this", cacheBreakpoint: true),
+                ResponseInputBuilder.inputImage(urlString: "data:image/png;base64,abc", detail: .original)
+            ])],
+            reasoning: ResponseReasoning(effort: .max, summary: .auto, mode: .pro, context: .allTurns),
+            store: false,
+            include: ["reasoning.encrypted_content"],
+            serviceTier: "priority",
+            promptCacheKey: "thread:123",
+            promptCacheOptions: PromptCacheOptions(mode: .explicit),
+            safetyIdentifier: "stable-user-hash",
+            maxOutputTokens: 128_000,
+            text: ResponseTextOptions(verbosity: .high),
+            multiAgent: MultiAgentConfiguration(maxConcurrentSubagents: 4)
+        )
+
+        let json = try JSONDecoder.codex.decode(JSONValue.self, from: JSONEncoder.codexCompact.encode(request))
+        XCTAssertEqual(json["model"]?.stringValue, "gpt-5.6-sol")
+        XCTAssertEqual(json["reasoning"]?["effort"]?.stringValue, "max")
+        XCTAssertEqual(json["reasoning"]?["mode"]?.stringValue, "pro")
+        XCTAssertEqual(json["reasoning"]?["context"]?.stringValue, "all_turns")
+        XCTAssertEqual(json["prompt_cache_options"]?["mode"]?.stringValue, "explicit")
+        XCTAssertEqual(json["prompt_cache_options"]?["ttl"]?.stringValue, "30m")
+        XCTAssertEqual(json["multi_agent"]?["max_concurrent_subagents"]?.doubleValue, 4)
+        XCTAssertEqual(json["input"]?.arrayValue?.first?["content"]?.arrayValue?.last?["detail"]?.stringValue, "original")
+        XCTAssertEqual(
+            json["input"]?.arrayValue?.first?["content"]?.arrayValue?.first?["prompt_cache_breakpoint"]?["mode"]?.stringValue,
+            "explicit"
+        )
+    }
+
+    func testProgrammaticFunctionToolAndCallerLinkageEncode() throws {
+        let schema = ToolSchemas.object(properties: ["value": ToolSchemas.string()], required: ["value"])
+        let definition = ToolDefinition(
+            name: "lookup",
+            description: "Return structured lookup data.",
+            parameters: schema,
+            strict: true,
+            outputSchema: schema,
+            allowedCallers: [.direct, .programmatic]
+        ).responseTool
+        XCTAssertEqual(definition.fields["strict"]?.boolValue, true)
+        XCTAssertEqual(definition.fields["allowed_callers"]?.arrayValue?.count, 2)
+
+        let caller: JSONValue = .object(["type": .string("program"), "caller_id": .string("call_program")])
+        let call = ToolCall(id: "fc_1", callID: "call_1", name: "lookup", arguments: "{}", caller: caller)
+        XCTAssertEqual(ResponseInputBuilder.functionCall(call)["caller"], caller)
+        XCTAssertEqual(ResponseInputBuilder.functionCallOutput(callID: call.callID, output: "{}", caller: call.caller)["caller"], caller)
+    }
+
+    func testMultiAgentRequestAddsBetaHeader() async throws {
+        StubURLProtocol.handler = { request in
+            XCTAssertEqual(request.value(forHTTPHeaderField: "OpenAI-Beta"), "responses_multi_agent=v1")
+            let body = try JSONDecoder.codex.decode(JSONValue.self, from: request.bodyData())
+            XCTAssertEqual(body["multi_agent"]?["enabled"]?.boolValue, true)
+            return StubURLProtocol.response(for: request, json: #"{"output_text":"ok"}"#)
+        }
+        defer { StubURLProtocol.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let client = OpenAIResponsesClient(auth: StaticAuthProvider(), session: URLSession(configuration: configuration))
+        let request = ResponsesRequest(
+            model: OpenAIModel.gpt56Sol.rawValue,
+            input: [ResponseInputBuilder.userMessage("review this")],
+            multiAgent: MultiAgentConfiguration()
+        )
+        for try await _ in client.streamResponse(request) {}
     }
 
     func testResponsesRequestEncodesBackgroundAndStoreFlags() throws {

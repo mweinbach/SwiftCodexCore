@@ -148,13 +148,21 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
     public var includeReasoningDeltas: Bool
     public var reasoningEffort: ReasoningEffort?
     public var reasoningSummary: ReasoningSummary?
+    public var reasoningMode: ReasoningMode?
+    public var reasoningContext: ReasoningContext?
+    public var serviceTier: String?
+    public var promptCacheKey: String?
+    public var promptCacheOptions: PromptCacheOptions?
+    public var safetyIdentifier: String?
+    public var maxOutputTokens: Int?
+    public var multiAgent: MultiAgentConfiguration?
     public var backgroundAccessEnabled: Bool
     public var projectInstructionOptions: ProjectInstructionOptions
     public var skillOptions: SkillInjectionOptions
     public var serverTools: [ResponseToolDefinition]
 
     public init(
-        model: String = "gpt-5.4",
+        model: String = OpenAIModel.gpt56.rawValue,
         instructions: String = "",
         systemPromptMode: SystemPromptMode = .append,
         additionalSystemInstructions: [String] = [],
@@ -166,6 +174,14 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
         includeReasoningDeltas: Bool = true,
         reasoningEffort: ReasoningEffort? = nil,
         reasoningSummary: ReasoningSummary? = nil,
+        reasoningMode: ReasoningMode? = nil,
+        reasoningContext: ReasoningContext? = nil,
+        serviceTier: String? = nil,
+        promptCacheKey: String? = nil,
+        promptCacheOptions: PromptCacheOptions? = nil,
+        safetyIdentifier: String? = nil,
+        maxOutputTokens: Int? = nil,
+        multiAgent: MultiAgentConfiguration? = nil,
         backgroundAccessEnabled: Bool = false,
         projectInstructionOptions: ProjectInstructionOptions = ProjectInstructionOptions(),
         skillOptions: SkillInjectionOptions = SkillInjectionOptions(),
@@ -183,6 +199,14 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
         self.includeReasoningDeltas = includeReasoningDeltas
         self.reasoningEffort = reasoningEffort
         self.reasoningSummary = reasoningSummary
+        self.reasoningMode = reasoningMode
+        self.reasoningContext = reasoningContext
+        self.serviceTier = serviceTier
+        self.promptCacheKey = promptCacheKey
+        self.promptCacheOptions = promptCacheOptions
+        self.safetyIdentifier = safetyIdentifier
+        self.maxOutputTokens = maxOutputTokens
+        self.multiAgent = multiAgent
         self.backgroundAccessEnabled = backgroundAccessEnabled
         self.projectInstructionOptions = projectInstructionOptions
         self.skillOptions = skillOptions
@@ -191,11 +215,16 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
 }
 
 public enum ReasoningEffort: String, Codable, Sendable, Equatable, CaseIterable {
+    case none
     case minimal
     case low
     case medium
     case high
     case xhigh
+    case max
+    /// Codex can advertise `ultra` for hosted multi-agent execution. The public
+    /// GPT-5.6 Responses API currently tops out at `max`.
+    case ultra
 }
 
 public enum ReasoningSummary: String, Codable, Sendable, Equatable, CaseIterable {
@@ -203,6 +232,17 @@ public enum ReasoningSummary: String, Codable, Sendable, Equatable, CaseIterable
     case auto
     case concise
     case detailed
+}
+
+public enum ReasoningMode: String, Codable, Sendable, Equatable, CaseIterable {
+    case standard
+    case pro
+}
+
+public enum ReasoningContext: String, Codable, Sendable, Equatable, CaseIterable {
+    case auto
+    case currentTurn = "current_turn"
+    case allTurns = "all_turns"
 }
 
 
@@ -255,13 +295,23 @@ public struct ToolCall: Codable, Sendable, Equatable, Identifiable {
     public var name: String
     public var arguments: String
     public var rawArguments: JSONValue?
+    /// Opaque Responses linkage for calls made from hosted programs or agents.
+    public var caller: JSONValue?
 
-    public init(id: String = UUID().uuidString, callID: String, name: String, arguments: String, rawArguments: JSONValue? = nil) {
+    public init(
+        id: String = UUID().uuidString,
+        callID: String,
+        name: String,
+        arguments: String,
+        rawArguments: JSONValue? = nil,
+        caller: JSONValue? = nil
+    ) {
         self.id = id
         self.callID = callID
         self.name = name
         self.arguments = arguments
         self.rawArguments = rawArguments
+        self.caller = caller
     }
 }
 
@@ -269,10 +319,23 @@ public struct TokenUsage: Codable, Sendable, Equatable {
     public var inputTokens: Int?
     public var outputTokens: Int?
     public var totalTokens: Int?
+    public var cachedInputTokens: Int?
+    public var cacheWriteTokens: Int?
+    public var reasoningOutputTokens: Int?
 
-    public init(inputTokens: Int? = nil, outputTokens: Int? = nil, totalTokens: Int? = nil) {
+    public init(
+        inputTokens: Int? = nil,
+        outputTokens: Int? = nil,
+        totalTokens: Int? = nil,
+        cachedInputTokens: Int? = nil,
+        cacheWriteTokens: Int? = nil,
+        reasoningOutputTokens: Int? = nil
+    ) {
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
         self.totalTokens = totalTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.cacheWriteTokens = cacheWriteTokens
+        self.reasoningOutputTokens = reasoningOutputTokens
     }
 }
