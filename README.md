@@ -13,7 +13,9 @@ A SwiftPM package that implements a Codex-style agent core in Swift:
 - subagent graph and `spawn_subagent` tool
 - API-key auth plus Codex-compatible ChatGPT OAuth/cache/refresh helpers
 - AGENTS.md project-instruction injection and SKILL.md progressive skill injection
-- built-in Responses server-tool definitions for web search, image generation, and remote MCP
+- dynamic Codex-style `/models` discovery with ETag refresh and an offline cache
+- GPT-5.6 reasoning, caching, multimodal, compaction, Multi-agent, and programmatic-tool controls
+- built-in Responses server-tool definitions for web/file search, image generation, hosted shell, code interpreter, apply patch, skills, computer use, tool search, and remote MCP
 - high-level `CodexRuntime` facade for app/server integrations
 
 This is intentionally a core package, not a terminal UI. Use it under a CLI, desktop app, IDE extension, app server, or browser-side controller.
@@ -29,6 +31,38 @@ swift run codex-core-example
 
 The implementation is production-shaped but not production-hardened. In particular, the local file/shell sandbox is policy enforcement, not an OS-level sandbox; ChatGPT OAuth mirrors the public Codex OAuth/cache/device-code shape but still depends on the live OpenAI auth service accepting the public client flow; and the Responses client streams SSE incrementally through `URLSession.bytes`.
 
+## GPT-5.6 and current Codex alignment
+
+The package was compared against OpenAI Codex at commit [`800715d`](https://github.com/openai/codex/commit/800715d201651a2a07c2706dca10400109dae3d3). Model capabilities are not treated as a permanent Swift table: `OpenAIModelsManager` queries the provider's `/models?client_version=...` endpoint, preserves unknown fields, caches the result for five minutes, and refreshes when a Responses stream returns `X-Models-Etag`. A small Sol/Terra/Luna catalog is retained only for first launch and offline recovery.
+
+The [public GPT-5.6 API documentation](https://developers.openai.com/api/docs/models/gpt-5.6-sol) advertises a 1,050,000-token context window and 128,000 maximum output tokens. The [pinned Codex catalog](https://github.com/openai/codex/blob/800715d201651a2a07c2706dca10400109dae3d3/codex-rs/models-manager/models.json) currently advertises a 372,000-token effective context for Sol, Terra, and Luna. Use the dynamic catalog for runtime behavior; do not assume those two limits are interchangeable.
+
+```swift
+let auth = try await ChatGPTAuthProvider.fromCodexAuthFile()
+let responseOptions = OpenAIResponsesClient.Options.chatGPTCodexBackend
+let models = OpenAIModelsManager(
+    auth: auth,
+    options: .derivedFromResponsesEndpoint(
+        responseOptions.endpoint,
+        clientVersion: "1.0.0" // your host app version
+    )
+)
+
+let catalog = await models.catalog()
+var config = AgentConfiguration()
+if let selected = catalog.defaultModel {
+    config.applyModelDefaults(selected)
+}
+
+let model = OpenAIResponsesClient(
+    auth: auth,
+    options: responseOptions,
+    modelsManager: models
+)
+```
+
+Detailed Codex catalogs are authoritative. The standard OpenAI `/v1/models` shape is also accepted; its IDs are merged with fallback metadata because that endpoint does not currently return the full Codex capability record.
+
 ## Quick start with API-key auth
 
 ```swift
@@ -40,7 +74,7 @@ let auth = APIKeyAuthProvider(apiKey: apiKey)
 let model = OpenAIResponsesClient(auth: auth)
 
 var config = AgentConfiguration(
-    model: "gpt-5.4",
+    model: OpenAIModel.gpt56Sol.rawValue,
     instructions: "You are a careful coding agent. Use tools when useful.",
     workspaceURL: URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
     approvalPolicy: .onRequest,
@@ -77,7 +111,7 @@ let environment = try JustBashCodexFactory.makeEnvironment(
     modelProvider: model,
     workspaceRootURL: workspace,
     configuration: AgentConfiguration(
-        model: "gpt-5.4",
+        model: OpenAIModel.gpt56Luna.rawValue,
         instructions: "You are a careful coding agent running on iOS.",
         approvalPolicy: .onRequest,
         sandboxPolicy: .workspaceWrite
@@ -181,6 +215,48 @@ await runtime.addServerTool(.remoteMCP(
     requireApproval: "never"
 ))
 ```
+
+## GPT-5.6 Responses controls
+
+GPT-5.6 request controls are available at both the low-level `ResponsesRequest` layer and the high-level agent loop:
+
+```swift
+var config = AgentConfiguration(
+    model: OpenAIModel.gpt56Terra.rawValue,
+    reasoningEffort: .max,
+    reasoningMode: .pro,
+    reasoningContext: .allTurns,
+    serviceTier: "priority",
+    promptCacheOptions: PromptCacheOptions(mode: .explicit),
+    safetyIdentifier: "<stable-user-hash>",
+    maxOutputTokens: 128_000,
+    multiAgent: MultiAgentConfiguration(maxConcurrentSubagents: 3),
+    textOptions: ResponseTextOptions(verbosity: .low)
+)
+config.serverTools = [
+    .programmaticToolCalling(),
+    .hostedShell(allowedCallers: [.direct, .programmatic]),
+    .applyPatch(allowedCallers: [.programmatic]),
+    .toolSearch()
+]
+```
+
+The client automatically sends the Multi-agent beta header, suppresses unsupported reasoning summaries during Multi-agent runs, exposes only the root `final_answer` as the user-facing completion, and preserves agent/program/reasoning items for the next stateless request. Programmatic function calls retain their `caller` linkage through local execution and `function_call_output`.
+
+Multimodal high-level turns accept the same content blocks as the Responses API:
+
+```swift
+let input = TurnInput(content: [
+    ResponseInputBuilder.inputText("Inspect this screenshot"),
+    ResponseInputBuilder.inputImage(
+        urlString: "<data:image/png;base64,...>",
+        detail: .original
+    )
+])
+let handle = try await runtime.startTurn(threadID: thread.id, input: input)
+```
+
+Server-side compaction can be selected manually with `contextManagement`, or populated from the dynamic model metadata by `applyModelDefaults`. Compaction output is stored and replayed while obsolete pre-compaction conversation items are pruned. For explicit stateless control, call `OpenAIResponsesClient.compactResponse(_:)` and pass its complete `output` into the next Responses request.
 
 ## ChatGPT / Codex auth
 
@@ -294,6 +370,7 @@ Sources/CodexCore
   CodexRuntime.swift           High-level app/server facade
   CodexDefaultLocations.swift  Platform-safe default storage locations
   ResponsesModels.swift        Responses request + canonical stream events
+  OpenAIModels.swift           Dynamic model catalog, cache, ETag refresh, fallbacks
   OpenAIResponsesClient.swift  HTTP Responses-compatible transport
   Prompting.swift              Default prompt, AGENTS.md loader, skill discovery/injection
   Tools.swift                  Tool protocol, registry, schemas
