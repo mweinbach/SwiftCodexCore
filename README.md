@@ -80,7 +80,7 @@ let definition = ToolDefinition(
 var config = AgentConfiguration(toolMode: .codeModeOnly)
 ```
 
-Each `exec` call runs in a fresh JavaScriptCore context without Node, filesystem, network, or console globals. It supports async nested tool calls, `text`, `image`, `generatedImage`, `notify`, session `store`/`load`, timers, `exit`, `yield_control`, the upstream Lark grammar, first-line execution pragmas, and yielded cells that can be polled or terminated with `wait`.
+Each `exec` call runs in a fresh JavaScriptCore context without Node, filesystem, network, or console globals. It supports async nested tool calls, textual/JSON emissions, thread-scoped `store`/`load`, timers, `exit`, the upstream Lark grammar, first-line execution pragmas, and long-running cells that can be polled with `wait`. The image/notification helpers serialize values into the tool output for the host to interpret, and `yield_control` is present for source compatibility while timed yielding is controlled by the pragma/runtime timeout. JavaScriptCore does not provide a public hard-interrupt API on these platforms, so terminating a cell stops tracking it but cannot preempt synchronous non-yielding JavaScript; do not treat this process-local runtime as an OS security boundary.
 
 ## Quick start with API-key auth
 
