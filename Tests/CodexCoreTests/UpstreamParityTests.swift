@@ -43,6 +43,16 @@ final class UpstreamParityTests: XCTestCase {
         info.supportsOriginalImageDetail, expected.boolean("supports_image_detail_original"))
       XCTAssertEqual(info.supportsSearchTool, expected.boolean("supports_search_tool"))
       XCTAssertEqual(info.usesResponsesLite, expected.boolean("use_responses_lite"))
+      XCTAssertEqual(info.prefersWebSockets, expected.boolean("prefer_websockets"))
+      XCTAssertEqual(info.supportsVerbosity, expected.boolean("support_verbosity"))
+      XCTAssertEqual(info.defaultVerbosity?.rawValue, expected.string("default_verbosity"))
+      XCTAssertEqual(info.applyPatchToolType, expected.string("apply_patch_tool_type"))
+      XCTAssertEqual(info.webSearchToolType, expected.string("web_search_tool_type"))
+      XCTAssertEqual(info.shellType, expected.string("shell_type"))
+      XCTAssertEqual(info.truncationMode, "tokens")
+      XCTAssertEqual(info.truncationLimit, 10_000)
+      XCTAssertEqual(info.reasoningSummaryFormat, expected.string("reasoning_summary_format"))
+      XCTAssertEqual(info.minimalClientVersion, expected.string("minimal_client_version"))
       XCTAssertEqual(info.inputModalities, expected.strings("input_modalities"))
       XCTAssertEqual(info.visibility, expected.string("visibility"))
       XCTAssertEqual(info.supportedInAPI, expected.boolean("supported_in_api"))
@@ -65,6 +75,15 @@ final class UpstreamParityTests: XCTestCase {
       XCTAssertEqual(
         configuration.parallelToolCalls, expected.boolean("supports_parallel_tool_calls"))
       XCTAssertEqual(configuration.toolMode?.rawValue, expected.string("tool_mode"))
+      XCTAssertEqual(
+        configuration.textOptions?.verbosity?.rawValue, expected.string("default_verbosity"))
+      XCTAssertEqual(configuration.useResponsesLite, expected.boolean("use_responses_lite"))
+      XCTAssertEqual(
+        configuration.skillOptions.includeUsageInstructions,
+        expected.boolean("include_skills_usage_instructions")
+      )
+      XCTAssertEqual(configuration.codeModeOptions?.defaultMaxOutputTokens, 10_000)
+      XCTAssertEqual(configuration.codeModeOptions?.allowOriginalImageDetail, true)
     }
   }
 
@@ -85,6 +104,9 @@ final class UpstreamParityTests: XCTestCase {
         fallback.supportsOriginalImageDetail, expected.boolean("supports_image_detail_original"))
       XCTAssertEqual(fallback.supportsSearchTool, expected.boolean("supports_search_tool"))
       XCTAssertEqual(fallback.usesResponsesLite, expected.boolean("use_responses_lite"))
+      XCTAssertEqual(fallback.prefersWebSockets, expected.boolean("prefer_websockets"))
+      XCTAssertEqual(fallback.defaultVerbosity?.rawValue, expected.string("default_verbosity"))
+      XCTAssertEqual(fallback.truncationLimit, 10_000)
       XCTAssertEqual(fallback.inputModalities, expected.strings("input_modalities"))
       XCTAssertEqual(fallback.visibility, expected.string("visibility"))
       XCTAssertEqual(fallback.supportedInAPI, expected.boolean("supported_in_api"))
@@ -93,6 +115,30 @@ final class UpstreamParityTests: XCTestCase {
       XCTAssertEqual(fallback.supportedReasoningEffortNames, expected.reasoningEfforts)
       XCTAssertEqual(fallback.multiAgentVersion, expected.string("multi_agent_version"))
     }
+  }
+
+  func testDynamicModelMetadataRejectsUnsafeIntegers() {
+    let info = OpenAIModelInfo(fields: [
+      "slug": .string("future-model"),
+      "priority": .number(.infinity),
+      "context_window": .number(1e300),
+      "max_context_window": .number(-1),
+      "auto_compact_token_limit": .number(2.5),
+      "truncation_policy": .object([
+        "mode": .string("tokens"),
+        "limit": .number(1e300),
+      ]),
+    ])
+
+    XCTAssertNil(info.priority)
+    XCTAssertNil(info.contextWindow)
+    XCTAssertNil(info.maximumContextWindow)
+    XCTAssertNil(info.automaticCompactionTokenLimit)
+    XCTAssertNil(info.truncationLimit)
+
+    var configuration = AgentConfiguration()
+    configuration.applyModelDefaults(info)
+    XCTAssertEqual(configuration.model, "future-model")
   }
 
   private func loadManifest() throws -> ParityManifest {
@@ -177,7 +223,7 @@ private struct ExpectedModel: Decodable {
   }
 
   func integer(_ field: String) -> Int? {
-    fields[field]?.doubleValue.map(Int.init)
+    fields[field]?.doubleValue.flatMap { Int(exactly: $0) }
   }
 
   func boolean(_ field: String) -> Bool? {

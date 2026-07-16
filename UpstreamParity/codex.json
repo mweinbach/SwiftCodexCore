@@ -3,7 +3,7 @@
   "upstream": {
     "repository": "https://github.com/openai/codex.git",
     "branch": "main",
-    "commit": "800715d201651a2a07c2706dca10400109dae3d3"
+    "commit": "1d941253e9354fe583a033660a6288df66e27488"
   },
   "sources": {
     "model_catalog": {
@@ -17,6 +17,10 @@
     "tool_mode_dispatch": {
       "path": "codex-rs/core/src/tools/mod.rs",
       "sha256": "70017fc7f721a4b8e9aef5996e72dc5f2f62f4f5500afc824447db557429ca20"
+    },
+    "raw_response_schema": {
+      "path": "codex-rs/app-server-protocol/schema/json/v2/RawResponseCompletedNotification.json",
+      "sha256": "dab430b6c6e2ebb51d1fa2acdc597418ce68b12710382d4d93b652efd47fb61a"
     }
   },
   "contracts": {
@@ -30,12 +34,24 @@
             "context_window": 372000,
             "max_context_window": 372000,
             "tool_mode": "code_mode_only",
+            "prefer_websockets": true,
+            "support_verbosity": true,
+            "default_verbosity": "low",
             "apply_patch_tool_type": "freeform",
+            "web_search_tool_type": "text_and_image",
             "shell_type": "shell_command",
+            "truncation_policy": {
+              "mode": "tokens",
+              "limit": 10000
+            },
             "supports_parallel_tool_calls": true,
             "supports_image_detail_original": true,
             "supports_search_tool": true,
             "use_responses_lite": true,
+            "include_skills_usage_instructions": false,
+            "reasoning_summary_format": "experimental",
+            "default_reasoning_summary": "none",
+            "minimal_client_version": "0.144.0",
             "input_modalities": [
               "text",
               "image"
@@ -61,12 +77,24 @@
             "context_window": 372000,
             "max_context_window": 372000,
             "tool_mode": "code_mode_only",
+            "prefer_websockets": true,
+            "support_verbosity": true,
+            "default_verbosity": "low",
             "apply_patch_tool_type": "freeform",
+            "web_search_tool_type": "text_and_image",
             "shell_type": "shell_command",
+            "truncation_policy": {
+              "mode": "tokens",
+              "limit": 10000
+            },
             "supports_parallel_tool_calls": true,
             "supports_image_detail_original": true,
             "supports_search_tool": true,
             "use_responses_lite": true,
+            "include_skills_usage_instructions": false,
+            "reasoning_summary_format": "experimental",
+            "default_reasoning_summary": "none",
+            "minimal_client_version": "0.144.0",
             "input_modalities": [
               "text",
               "image"
@@ -92,12 +120,24 @@
             "context_window": 372000,
             "max_context_window": 372000,
             "tool_mode": "code_mode_only",
+            "prefer_websockets": true,
+            "support_verbosity": true,
+            "default_verbosity": "low",
             "apply_patch_tool_type": "freeform",
+            "web_search_tool_type": "text_and_image",
             "shell_type": "shell_command",
+            "truncation_policy": {
+              "mode": "tokens",
+              "limit": 10000
+            },
             "supports_parallel_tool_calls": true,
             "supports_image_detail_original": true,
             "supports_search_tool": true,
             "use_responses_lite": true,
+            "include_skills_usage_instructions": false,
+            "reasoning_summary_format": "experimental",
+            "default_reasoning_summary": "none",
+            "minimal_client_version": "0.144.0",
             "input_modalities": [
               "text",
               "image"
@@ -137,6 +177,17 @@
         "ToolMode::CodeModeOnly",
         "Feature::CodeMode",
         "Feature::CodeModeOnly"
+      ]
+    },
+    "raw_response_usage": {
+      "source": "raw_response_schema",
+      "fields": [
+        "cacheWriteInputTokens",
+        "cachedInputTokens",
+        "inputTokens",
+        "outputTokens",
+        "reasoningOutputTokens",
+        "totalTokens"
       ]
     }
   }

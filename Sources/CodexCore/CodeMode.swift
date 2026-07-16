@@ -1,118 +1,232 @@
 import Foundation
-import JavaScriptCore
 
-/// Codex-compatible local JavaScript execution for models advertising
-/// `tool_mode: code_mode_only`. Each call gets a fresh JavaScriptCore context;
-/// the runtime intentionally exposes no Node, filesystem, network, or console
-/// globals. Agent tools remain behind `ToolRegistry`, so normal approval and
-/// sandbox checks still apply to calls made through `tools.*`.
+/// Codex-compatible code-mode coordinator. Execution is delegated to a
+/// pluggable engine while this actor owns cell lifecycle, incremental cursors,
+/// thread-scoped state, and output budgets.
 public actor CodeModeRuntime {
-    public static let execToolName = "exec"
-    public static let waitToolName = "wait"
+  public static let execToolName = "exec"
+  public static let waitToolName = "wait"
 
-    private let registry: ToolRegistry
-    private struct RunningCell: Sendable {
-        var threadID: String
-        var task: Task<ToolResult, Never>
+  private struct RunningCell: Sendable {
+    var threadID: String
+    var session: any CodeModeCellSession
+    var cursor: Int
+    var yieldVersion: Int
+    var createdAt: Date
+    var storeMerged: Bool
+    var waitInFlight: Bool
+    var allowOriginalImageDetail: Bool
+    var maxContentBlockBytes: Int
+  }
+
+  private let registry: ToolRegistry
+  private let engine: any CodeModeEngine
+  private let tokenCounter: any CodeModeTokenCounting
+  private let diagnostics: CodeModeDiagnosticsHandler
+  private var cells: [String: RunningCell] = [:]
+  private var sessionStores: [String: [String: JSONValue]] = [:]
+
+  public init(
+    registry: ToolRegistry,
+    engine: any CodeModeEngine = AutomaticCodeModeEngine(),
+    tokenCounter: any CodeModeTokenCounting = EstimatedCodeModeTokenCounter(),
+    diagnostics: @escaping CodeModeDiagnosticsHandler = { _ in }
+  ) {
+    self.registry = registry
+    self.engine = engine
+    self.tokenCounter = tokenCounter
+    self.diagnostics = diagnostics
+  }
+
+  public func execute(
+    source: String,
+    definitions: [ToolDefinition],
+    context: ToolExecutionContext,
+    options: CodeModeOptions = CodeModeOptions()
+  ) async -> ToolResult {
+    let executionOptions: ExecutionOptions
+    do {
+      executionOptions = try Self.parseExecSource(source, defaults: options)
+    } catch {
+      return ToolResult(content: String(describing: error), isError: true)
     }
-    private var cells: [String: RunningCell] = [:]
-    private var sessionStores: [String: [String: JSONValue]] = [:]
-
-    public init(registry: ToolRegistry) {
-        self.registry = registry
-    }
-
-    public func execute(
-        source: String,
-        definitions: [ToolDefinition],
-        context: ToolExecutionContext
-    ) async -> ToolResult {
-        let options = Self.parsePragma(source)
-        let cellID = UUID().uuidString.lowercased()
-        let store = sessionStores[context.threadID] ?? [:]
-        let task = Task.detached { [registry] in
-            await CodeModeCell.run(
-                source: source,
-                definitions: definitions,
-                registry: registry,
-                context: context,
-                initialStore: store,
-                maxOutputTokens: options.maxOutputTokens
-            )
-        }
-        cells[cellID] = RunningCell(threadID: context.threadID, task: task)
-
-        if let result = await Self.firstResult(of: task, afterMilliseconds: options.yieldTimeMilliseconds) {
-            cells.removeValue(forKey: cellID)
-            mergeStore(from: result, threadID: context.threadID)
-            return Self.withoutStoreMetadata(result)
-        }
-        return ToolResult(
-            content: "Script running with cell ID \(cellID).",
-            metadata: ["cell_id": .string(cellID), "running": .bool(true)]
-        )
-    }
-
-    public func wait(arguments: JSONValue) async -> ToolResult {
-        guard let cellID = arguments["cell_id"]?.stringValue, let cell = cells[cellID] else {
-            return ToolResult(content: "Unknown or completed code-mode cell.", isError: true)
-        }
-        if arguments["terminate"]?.boolValue == true {
-            cell.task.cancel()
-            cells.removeValue(forKey: cellID)
-            return ToolResult(content: "Terminated code-mode cell \(cellID).")
-        }
-        let milliseconds = Self.clampedMilliseconds(arguments["yield_time_ms"]?.doubleValue.map(Int.init) ?? 10_000)
-        if let result = await Self.firstResult(of: cell.task, afterMilliseconds: milliseconds) {
-            cells.removeValue(forKey: cellID)
-            mergeStore(from: result, threadID: cell.threadID)
-            let visible = Self.withoutStoreMetadata(result)
-            let maxTokens = max(1, min(arguments["max_tokens"]?.doubleValue.map(Int.init) ?? 10_000, 100_000))
-            return Self.limitingOutput(visible, maxTokens: maxTokens)
-        }
-        return ToolResult(
-            content: "Script still running with cell ID \(cellID).",
-            metadata: ["cell_id": .string(cellID), "running": .bool(true)]
-        )
-    }
-
-    public static func responseTools(definitions: [ToolDefinition]) -> [ResponseToolDefinition] {
-        [execResponseTool(definitions: definitions), waitResponseTool]
-    }
-
-    public static func execResponseTool(definitions: [ToolDefinition]) -> ResponseToolDefinition {
-        let available = definitions
-            .filter { ($0.exposure ?? .direct) == .direct || $0.exposure == .deferred }
-            .map { "- `tools.\($0.name)(...)`: \($0.description)" }
-            .joined(separator: "\n")
-        let suffix = available.isEmpty ? "" : "\n\nAvailable nested tools:\n\(available)"
-        return .custom(
-            name: execToolName,
-            description: """
-            Runs raw JavaScript in a fresh, sandboxed async module. Nested tools are available on `tools`, and `ALL_TOOLS` describes every nested tool. Use `text(value)` to emit output. Optional first-line pragma: `// @exec: {\"yield_time_ms\":10000,\"max_output_tokens\":1000}`.
-            \(suffix)
-            """,
-            format: .object([
-                "type": .string("grammar"),
-                "syntax": .string("lark"),
-                "definition": .string(execGrammar)
-            ])
-        )
-    }
-
-    public static let waitResponseTool = ResponseToolDefinition(
-        name: waitToolName,
-        description: "Waits on a yielded `exec` cell and returns completion or a running status.",
-        parameters: ToolSchemas.object(properties: [
-            "cell_id": ToolSchemas.string(description: "Identifier of the running exec cell"),
-            "yield_time_ms": .object(["type": .string("number"), "description": .string("Wait before yielding; defaults to 10000 ms")]),
-            "max_tokens": .object(["type": .string("number"), "description": .string("Maximum returned output token estimate")]),
-            "terminate": ToolSchemas.boolean(description: "Terminate the running cell")
-        ], required: ["cell_id"]),
-        strict: false
+    enforceCellLimit(options.maxConcurrentCells)
+    let cellID = UUID().uuidString.lowercased()
+    let session = engine.start(
+      request: CodeModeExecutionRequest(
+        source: executionOptions.source,
+        definitions: definitions,
+        registry: registry,
+        context: context,
+        initialStore: sessionStores[context.threadID] ?? [:],
+        options: options,
+        maxOutputTokens: executionOptions.maxOutputTokens,
+        tokenCounter: tokenCounter
+      ))
+    let runningCell = RunningCell(
+      threadID: context.threadID,
+      session: session,
+      cursor: 0,
+      yieldVersion: 0,
+      createdAt: Date(),
+      storeMerged: false,
+      waitInFlight: false,
+      allowOriginalImageDetail: options.allowOriginalImageDetail,
+      maxContentBlockBytes: max(1_024, min(options.maxContentBlockBytes, 64 * 1024 * 1024))
     )
+    cells[cellID] = runningCell
+    diagnostics(
+      CodeModeDiagnostic(
+        kind: .cellStarted,
+        cellID: cellID,
+        threadID: context.threadID,
+        state: .running
+      ))
+    Task { [weak self] in
+      let completion = await session.completion()
+      await self?.recordCompletion(cellID: cellID, completion: completion)
+    }
+    let snapshot = await session.wait(
+      cursor: 0,
+      yieldVersion: 0,
+      timeoutMilliseconds: executionOptions.yieldTimeMilliseconds
+    )
+    return consume(
+      cellID: cellID,
+      snapshot: snapshot,
+      maxTokens: executionOptions.maxOutputTokens,
+      runningPrefix: "Script running with cell ID \(cellID).",
+      knownCell: runningCell
+    )
+  }
 
-    public static let execGrammar = """
+  public func wait(arguments: JSONValue) async -> ToolResult {
+    guard let cellID = arguments["cell_id"]?.stringValue, let cell = cells[cellID] else {
+      return ToolResult(content: "Unknown or completed code-mode cell.", isError: true)
+    }
+    let maxTokens = Self.clampedInteger(
+      arguments["max_tokens"]?.doubleValue,
+      default: 10_000,
+      minimum: 1,
+      maximum: 100_000
+    )
+    if arguments["terminate"]?.boolValue == true {
+      cell.session.terminate()
+      let snapshot = await cell.session.wait(
+        cursor: cell.cursor,
+        yieldVersion: cell.yieldVersion,
+        timeoutMilliseconds: 0
+      )
+      return consume(
+        cellID: cellID,
+        snapshot: snapshot,
+        maxTokens: maxTokens,
+        runningPrefix: "Script still running with cell ID \(cellID).",
+        knownCell: cell
+      )
+    }
+    guard !cell.waitInFlight else {
+      return ToolResult(
+        content: "A wait is already in progress for code-mode cell \(cellID).", isError: true)
+    }
+    var waitingCell = cell
+    waitingCell.waitInFlight = true
+    cells[cellID] = waitingCell
+    let milliseconds = Self.clampedInteger(
+      arguments["yield_time_ms"]?.doubleValue,
+      default: 10_000,
+      minimum: 250,
+      maximum: 300_000
+    )
+    let snapshot = await cell.session.wait(
+      cursor: cell.cursor,
+      yieldVersion: cell.yieldVersion,
+      timeoutMilliseconds: milliseconds
+    )
+    return consume(
+      cellID: cellID,
+      snapshot: snapshot,
+      maxTokens: maxTokens,
+      runningPrefix: "Script still running with cell ID \(cellID).",
+      knownCell: cell
+    )
+  }
+
+  public func terminateCells(threadID: String, clearStore: Bool = false) {
+    let matchingCells = cells.filter { $0.value.threadID == threadID }
+    for (cellID, cell) in matchingCells {
+      cell.session.terminate()
+      cells.removeValue(forKey: cellID)
+    }
+    if clearStore {
+      sessionStores.removeValue(forKey: threadID)
+    }
+  }
+
+  public static func responseTools(
+    definitions: [ToolDefinition],
+    options: CodeModeOptions = CodeModeOptions()
+  ) -> [ResponseToolDefinition] {
+    [execResponseTool(definitions: definitions, options: options), waitResponseTool]
+  }
+
+  public static func execResponseTool(
+    definitions: [ToolDefinition],
+    options: CodeModeOptions = CodeModeOptions()
+  ) -> ResponseToolDefinition {
+    let bindings = CodeModeToolCatalog.bindings(definitions: definitions, options: options)
+    let eager = bindings.filter { $0.definition.exposure != .deferred }
+    let deferredCount = bindings.count - eager.count
+    let available =
+      eager
+      .map { "- `tools.\($0.publicName)(...)`: \($0.definition.description)" }
+      .joined(separator: "\n")
+    let suffix = available.isEmpty ? "" : "\n\nAvailable nested tools:\n\(available)"
+    let deferred =
+      deferredCount == 0
+      ? ""
+      : "\n\nAdditional deferred tools are listed in `ALL_TOOLS`; filter it by `name` and `description`, then call `tools[name](args)`."
+    return .custom(
+      name: execToolName,
+      description: """
+        Runs raw JavaScript in a fresh, restricted async module. Pass JavaScript source directly, not JSON, a quoted string, or a Markdown code fence. Node.js, filesystem, network, and console APIs are not exposed.
+
+        Call nested tools through `tools`, for example `await tools.some_tool({ key: "value" })`. Namespaced tools support both their normalized flat name and nested path. Tool failures reject the returned promise. `ALL_TOOLS` contains metadata for every enabled tool, including deferred tools.
+
+        Emit model-visible output with `text(value)`, `image(value, detail?)`, or `generatedImage(result)`. Remote image URLs are rejected; use a base64 `data:` URL or forward an MCP image content block. `notify(value)` emits and immediately yields. `store(key, value)` and `load(key)` persist JSON values for later cells in the same thread. `setTimeout`, `clearTimeout`, `exit`, and `yield_control()` are also available.
+
+        If the script is still running after the yield window, the result includes a cell ID. Continue it with `wait`, which returns only output not previously consumed. An optional strict first-line pragma can override the initial limits: `// @exec: {\"yield_time_ms\":10000,\"max_output_tokens\":1000}`.
+        \(suffix)\(deferred)
+        """,
+      format: .object([
+        "type": .string("grammar"),
+        "syntax": .string("lark"),
+        "definition": .string(execGrammar),
+      ])
+    )
+  }
+
+  public static let waitResponseTool = ResponseToolDefinition(
+    name: waitToolName,
+    description:
+      "Waits on a cell ID returned by `exec`. Each call returns only newly emitted output plus completion or running state. Use `max_tokens` to bound the returned text, `yield_time_ms` to control this wait, or `terminate` to stop the cell.",
+    parameters: ToolSchemas.object(
+      properties: [
+        "cell_id": ToolSchemas.string(description: "Identifier of the running exec cell"),
+        "yield_time_ms": .object([
+          "type": .string("number"),
+          "description": .string("Wait before yielding; defaults to 10000 ms"),
+        ]),
+        "max_tokens": .object([
+          "type": .string("number"),
+          "description": .string("Maximum returned output token estimate"),
+        ]),
+        "terminate": ToolSchemas.boolean(description: "Terminate the running cell"),
+      ], required: ["cell_id"]),
+    strict: false
+  )
+
+  public static let execGrammar = """
     start: pragma_source | plain_source
     pragma_source: PRAGMA_LINE NEWLINE SOURCE
     plain_source: SOURCE
@@ -122,315 +236,239 @@ public actor CodeModeRuntime {
     SOURCE: /[\\s\\S]+/
     """
 
-    private struct Options: Sendable {
-        var yieldTimeMilliseconds = 10_000
-        var maxOutputTokens = 10_000
+  private struct ExecutionOptions: Sendable {
+    var source: String
+    var yieldTimeMilliseconds: Int
+    var maxOutputTokens: Int
+  }
+
+  private struct SourceError: Error, CustomStringConvertible {
+    var description: String
+  }
+
+  private static func parseExecSource(_ source: String, defaults: CodeModeOptions) throws
+    -> ExecutionOptions
+  {
+    guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      throw SourceError(description: "exec expects raw JavaScript source text (non-empty).")
+    }
+    var result = ExecutionOptions(
+      source: source,
+      yieldTimeMilliseconds: clampedMilliseconds(defaults.defaultYieldTimeMilliseconds),
+      maxOutputTokens: max(1, min(defaults.defaultMaxOutputTokens, 100_000))
+    )
+    guard
+      let first = source.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+        .first,
+      first.trimmingCharacters(in: .whitespaces).hasPrefix("// @exec:"),
+      let colon = first.firstIndex(of: ":")
+    else { return result }
+    let parts = source.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+    guard parts.count == 2, !parts[1].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      throw SourceError(
+        description: "exec pragma must be followed by JavaScript source on subsequent lines")
+    }
+    let raw = String(first[first.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+    guard !raw.isEmpty, let data = raw.data(using: .utf8),
+      let value = try? JSONDecoder.codex.decode(JSONValue.self, from: data),
+      case .object(let fields) = value
+    else {
+      throw SourceError(
+        description:
+          "exec pragma must be a valid JSON object with supported fields `yield_time_ms` and `max_output_tokens`"
+      )
+    }
+    let unknown = fields.keys.filter { $0 != "yield_time_ms" && $0 != "max_output_tokens" }
+    guard unknown.isEmpty else {
+      throw SourceError(
+        description:
+          "exec pragma only supports `yield_time_ms` and `max_output_tokens`; got `\(unknown.sorted()[0])`"
+      )
+    }
+    if let value = try safeInteger(fields["yield_time_ms"], field: "yield_time_ms") {
+      result.yieldTimeMilliseconds = clampedMilliseconds(value)
+    }
+    if let value = try safeInteger(fields["max_output_tokens"], field: "max_output_tokens") {
+      result.maxOutputTokens = max(1, min(value, 100_000))
+    }
+    result.source = String(parts[1])
+    return result
+  }
+
+  private static func safeInteger(_ value: JSONValue?, field: String) throws -> Int? {
+    guard let value else { return nil }
+    guard let number = value.doubleValue, number.isFinite, number >= 0,
+      number.rounded(.towardZero) == number,
+      number <= 9_007_199_254_740_991,
+      number <= Double(Int.max)
+    else {
+      throw SourceError(
+        description: "exec pragma field `\(field)` must be a non-negative safe integer")
+    }
+    return Int(number)
+  }
+
+  private static func clampedMilliseconds(_ value: Int) -> Int { max(250, min(value, 300_000)) }
+
+  private static func clampedInteger(
+    _ value: Double?,
+    default defaultValue: Int,
+    minimum: Int,
+    maximum: Int
+  ) -> Int {
+    guard let value, !value.isNaN else { return defaultValue }
+    if value <= Double(minimum) { return minimum }
+    if !value.isFinite || value >= Double(maximum) { return maximum }
+    return Int(value.rounded(.towardZero))
+  }
+
+  private func consume(
+    cellID: String,
+    snapshot: CodeModeCellSnapshot,
+    maxTokens: Int,
+    runningPrefix: String,
+    knownCell: RunningCell? = nil
+  ) -> ToolResult {
+    let trackedCell = cells[cellID]
+    let isTerminal = snapshot.state == .completed || snapshot.state == .terminated
+    guard var cell = trackedCell ?? (isTerminal ? knownCell : nil) else {
+      return ToolResult(content: "Unknown or completed code-mode cell.", isError: true)
+    }
+    let isTracked = trackedCell != nil
+    if isTracked {
+      cell.cursor = snapshot.nextCursor
+      cell.yieldVersion = snapshot.yieldVersion
+      cell.waitInFlight = false
+      cells[cellID] = cell
+      if let completion = snapshot.completion {
+        mergeStoreIfNeeded(cellID: cellID, completion: completion)
+      }
     }
 
-    private static func parsePragma(_ source: String) -> Options {
-        guard let first = source.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first,
-              first.trimmingCharacters(in: .whitespaces).hasPrefix("// @exec:"),
-              let colon = first.firstIndex(of: ":") else { return Options() }
-        let raw = String(first[first.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
-        guard let data = raw.data(using: .utf8),
-              let value = try? JSONDecoder.codex.decode(JSONValue.self, from: data) else { return Options() }
-        return Options(
-            yieldTimeMilliseconds: clampedMilliseconds(value["yield_time_ms"]?.doubleValue.map(Int.init) ?? 10_000),
-            maxOutputTokens: max(1, min(value["max_output_tokens"]?.doubleValue.map(Int.init) ?? 10_000, 100_000))
-        )
+    var blocks = snapshot.content
+    blocks = blocks.map { block in
+      guard let data = try? JSONEncoder.codexCompact.encode(block),
+        data.count > cell.maxContentBlockBytes
+      else { return block }
+      return .text("[code-mode content block omitted: exceeded byte limit]")
     }
-
-    private static func clampedMilliseconds(_ value: Int) -> Int { max(250, min(value, 30_000)) }
-
-    private static func firstResult(of task: Task<ToolResult, Never>, afterMilliseconds milliseconds: Int) async -> ToolResult? {
-        await withCheckedContinuation { continuation in
-            let race = CodeModeRace(continuation)
-            Task {
-                race.resolve(await task.value)
-            }
-            DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(milliseconds)) {
-                race.resolve(nil)
-            }
+    if !cell.allowOriginalImageDetail {
+      blocks = blocks.map { block in
+        guard block.type == "image", block.fields["detail"]?.stringValue == "original" else {
+          return block
         }
+        var fields = block.fields
+        fields["detail"] = .string("high")
+        return ToolContentBlock(fields: fields)
+      }
     }
-
-    private func mergeStore(from result: ToolResult, threadID: String) {
-        guard let fields = result.metadata["code_mode_store"]?.objectValue else { return }
-        sessionStores[threadID] = fields
+    var rendered = blocks.compactMap(\.textValue).joined(separator: "\n")
+    if snapshot.state == .completed, let returned = snapshot.completion?.returnedValue,
+      returned != .null, blocks.isEmpty
+    {
+      let value = returned.stringValue ?? Self.jsonString(returned) ?? String(describing: returned)
+      blocks.append(.text(value))
+      rendered = value
     }
-
-    private static func withoutStoreMetadata(_ result: ToolResult) -> ToolResult {
-        var copy = result
-        copy.metadata.removeValue(forKey: "code_mode_store")
-        return copy
+    if let error = snapshot.completion?.error {
+      rendered = [rendered, error].filter { !$0.isEmpty }.joined(separator: "\n")
+      blocks.append(.text(error))
     }
-
-    private static func limitingOutput(_ result: ToolResult, maxTokens: Int) -> ToolResult {
-        let characterLimit = maxTokens * 4
-        guard result.content.count > characterLimit else { return result }
-        var copy = result
-        copy.content = String(result.content.prefix(characterLimit)) + "\n[output truncated]"
-        return copy
+    if snapshot.state == .running || snapshot.state == .yielded {
+      rendered = [rendered, runningPrefix].filter { !$0.isEmpty }.joined(separator: "\n")
+    } else if snapshot.state == .terminated, rendered.isEmpty {
+      rendered = "Script terminated."
     }
-}
-
-private final class CodeModeRace: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<ToolResult?, Never>?
-
-    init(_ continuation: CheckedContinuation<ToolResult?, Never>) {
-        self.continuation = continuation
+    let limited = CodeModeTokenBudget.truncate(
+      rendered,
+      maxTokens: maxTokens,
+      counter: tokenCounter,
+      marker: "\n[output truncated]"
+    )
+    rendered = limited.text
+    let wasTruncated = limited.truncated
+    if wasTruncated {
+      let nonTextBlocks = blocks.filter { $0.type != "text" }
+      blocks = nonTextBlocks + (rendered.isEmpty ? [] : [.text(rendered)])
+      if isTracked {
+        diagnostics(
+          CodeModeDiagnostic(
+            kind: .outputTruncated,
+            cellID: cellID,
+            threadID: cell.threadID,
+            state: snapshot.state,
+            message: "Code-mode output exceeded the configured budget."
+          ))
+      }
     }
-
-    func resolve(_ value: ToolResult?) {
-        lock.lock()
-        let current = continuation
-        continuation = nil
-        lock.unlock()
-        current?.resume(returning: value)
-    }
-}
-
-private final class CodeModeCell: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "SwiftCodexCore.CodeModeCell")
-    private let source: String
-    private let definitions: [ToolDefinition]
-    private let registry: ToolRegistry
-    private let context: ToolExecutionContext
-    private let initialStore: [String: JSONValue]
-    private let maxOutputTokens: Int
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<ToolResult, Never>?
-    private var jsContext: JSContext?
-
-    private init(
-        source: String,
-        definitions: [ToolDefinition],
-        registry: ToolRegistry,
-        context: ToolExecutionContext,
-        initialStore: [String: JSONValue],
-        maxOutputTokens: Int,
-        continuation: CheckedContinuation<ToolResult, Never>
-    ) {
-        self.source = source
-        self.definitions = definitions
-        self.registry = registry
-        self.context = context
-        self.initialStore = initialStore
-        self.maxOutputTokens = maxOutputTokens
-        self.continuation = continuation
-    }
-
-    static func run(
-        source: String,
-        definitions: [ToolDefinition],
-        registry: ToolRegistry,
-        context: ToolExecutionContext,
-        initialStore: [String: JSONValue],
-        maxOutputTokens: Int
-    ) async -> ToolResult {
-        await withCheckedContinuation { continuation in
-            let cell = CodeModeCell(
-                source: source,
-                definitions: definitions,
-                registry: registry,
-                context: context,
-                initialStore: initialStore,
-                maxOutputTokens: maxOutputTokens,
-                continuation: continuation
-            )
-            cell.start()
-        }
-    }
-
-    private func start() {
-        queue.async { [self] in
-            guard let js = JSContext() else {
-                finish(ToolResult(content: "Unable to create JavaScriptCore context.", isError: true))
-                return
-            }
-            jsContext = js
-            js.exceptionHandler = { [self] _, exception in
-                guard let exception else { return }
-                self.finish(ToolResult(content: exception.toString(), isError: true))
-            }
-
-            let toolCall: @convention(block) (String, String, String) -> Void = { [self] identifier, name, rawArguments in
-                invokeTool(identifier: identifier, name: name, rawArguments: rawArguments)
-            }
-            let timer: @convention(block) (String, Double) -> Void = { [self] identifier, milliseconds in
-                DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(max(0, Int(milliseconds)))) {
-                    self.queue.async {
-                        self.jsContext?.objectForKeyedSubscript("__fireTimer")?.call(withArguments: [identifier])
-                    }
-                }
-            }
-            let completed: @convention(block) (String) -> Void = { [self] payload in
-                complete(payload: payload)
-            }
-            js.setObject(toolCall, forKeyedSubscript: "__swiftToolCall" as NSString)
-            js.setObject(timer, forKeyedSubscript: "__swiftSetTimer" as NSString)
-            js.setObject(completed, forKeyedSubscript: "__swiftComplete" as NSString)
-
-            let bootstrap = CodeModeCell.bootstrap(
-                definitions: definitions,
-                initialStore: initialStore,
-                source: source
-            )
-            _ = js.evaluateScript(bootstrap)
-            if let exception = js.exception {
-                finish(ToolResult(content: exception.toString(), isError: true))
-            }
-        }
-    }
-
-    private func invokeTool(identifier: String, name: String, rawArguments: String) {
-        Task { [registry, context, self] in
-            let arguments: JSONValue
-            if let data = rawArguments.data(using: .utf8),
-               let decoded = try? JSONDecoder.codex.decode(JSONValue.self, from: data) {
-                arguments = decoded
-            } else {
-                arguments = .object([:])
-            }
-            do {
-                let result = try await registry.run(name: name, arguments: arguments, context: context)
-                if result.isError { throw CodexCoreError.invalidState(result.content) }
-                let value = result.structuredContent ?? Self.parseJSON(result.content) ?? .string(result.content)
-                deliver(identifier: identifier, value: value, error: nil)
-            } catch {
-                deliver(identifier: identifier, value: nil, error: String(describing: error))
-            }
-        }
-    }
-
-    private func deliver(identifier: String, value: JSONValue?, error: String?) {
-        queue.async { [self] in
-            guard let jsContext else { return }
-            let encoded = value.flatMap(Self.jsonString) ?? "null"
-            jsContext.objectForKeyedSubscript("__resolveTool")?.call(withArguments: [identifier, error == nil, encoded, error ?? ""])
-        }
-    }
-
-    private func complete(payload: String) {
-        guard let data = payload.data(using: .utf8),
-              let value = try? JSONDecoder.codex.decode(JSONValue.self, from: data) else {
-            finish(ToolResult(content: "Code-mode runtime returned an invalid completion payload.", isError: true))
-            return
-        }
-        let outputs = value["outputs"]?.arrayValue?.compactMap(\.stringValue) ?? []
-        let returned = value["value"]
-        var content = outputs.joined(separator: "\n")
-        if content.isEmpty, let returned, returned != .null {
-            content = returned.stringValue ?? Self.jsonString(returned) ?? String(describing: returned)
-        }
-        let limit = maxOutputTokens * 4
-        if content.count > limit {
-            content = String(content.prefix(limit)) + "\n[output truncated]"
-        }
-        let error = value["error"]?.stringValue
-        finish(ToolResult(
-            content: error ?? content,
-            isError: error != nil,
-            metadata: ["code_mode_store": value["store"] ?? .object([:])]
+    if isTerminal, isTracked { cells.removeValue(forKey: cellID) }
+    let diagnosticKind: CodeModeDiagnostic.Kind? =
+      switch snapshot.state {
+      case .yielded: .cellYielded
+      case .completed: .cellCompleted
+      case .terminated: .cellTerminated
+      case .running: nil
+      }
+    if let diagnosticKind, isTracked {
+      diagnostics(
+        CodeModeDiagnostic(
+          kind: diagnosticKind,
+          cellID: cellID,
+          threadID: cell.threadID,
+          state: snapshot.state,
+          message: snapshot.completion?.error
         ))
     }
+    return ToolResult(
+      content: rendered,
+      structuredContent: .object([
+        "cell_id": .string(cellID),
+        "state": .string(snapshot.state.rawValue),
+        "cursor": .number(Double(snapshot.nextCursor)),
+      ]),
+      isError: snapshot.completion?.error != nil,
+      metadata: [
+        "cell_id": .string(cellID),
+        "running": .bool(!isTerminal),
+        "state": .string(snapshot.state.rawValue),
+      ],
+      contentBlocks: blocks.isEmpty ? nil : blocks
+    )
+  }
 
-    private func finish(_ result: ToolResult) {
-        lock.lock()
-        let current = continuation
-        continuation = nil
-        lock.unlock()
-        jsContext = nil
-        current?.resume(returning: result)
-    }
+  private func recordCompletion(cellID: String, completion: CodeModeCompletion) {
+    mergeStoreIfNeeded(cellID: cellID, completion: completion)
+  }
 
-    private static func bootstrap(definitions: [ToolDefinition], initialStore: [String: JSONValue], source: String) -> String {
-        let available = definitions.filter { ($0.exposure ?? .direct) == .direct || $0.exposure == .deferred }
-        let toolValues: [JSONValue] = available.map { definition in
-            .object([
-                "name": .string(definition.name),
-                "description": .string(definition.description),
-                "parameters": definition.parameters,
-                "output_schema": definition.outputSchema ?? .null
-            ])
-        }
-        let toolsJSON = jsonString(.array(toolValues)) ?? "[]"
-        let storeJSON = jsonString(.object(initialStore)) ?? "{}"
-        return """
-        delete globalThis.console;
-        const ALL_TOOLS = \(toolsJSON);
-        const tools = Object.create(null);
-        const __pending = new Map();
-        const __timers = new Map();
-        const __outputs = [];
-        const __store = \(storeJSON);
-        let __nextID = 0;
-        function __normalize(value) {
-          if (value === undefined) return null;
-          return JSON.parse(JSON.stringify(value));
-        }
-        function __callTool(name, args) {
-          return new Promise((resolve, reject) => {
-            const id = String(++__nextID);
-            __pending.set(id, {resolve, reject});
-            __swiftToolCall(id, name, JSON.stringify(args ?? {}));
-          });
-        }
-        function __resolveTool(id, ok, payload, error) {
-          const pending = __pending.get(id);
-          if (!pending) return;
-          __pending.delete(id);
-          if (ok) pending.resolve(JSON.parse(payload)); else pending.reject(new Error(error));
-        }
-        for (const definition of ALL_TOOLS) tools[definition.name] = (args = {}) => __callTool(definition.name, args);
-        function text(value) {
-          const rendered = typeof value === 'string' ? value : JSON.stringify(__normalize(value));
-          __outputs.push(rendered);
-          return value;
-        }
-        function image(value) { return text(value); }
-        function generatedImage(value) { return text(value); }
-        function notify(value) { return text(value); }
-        function store(key, value) { __store[String(key)] = __normalize(value); return value; }
-        function load(key) { return __store[String(key)]; }
-        function exit() { throw new Error('__CODE_MODE_EXIT__'); }
-        function setTimeout(callback, milliseconds = 0) {
-          const id = String(++__nextID);
-          __timers.set(id, callback);
-          __swiftSetTimer(id, Number(milliseconds));
-          return id;
-        }
-        function clearTimeout(id) { __timers.delete(String(id)); }
-        function __fireTimer(id) {
-          const callback = __timers.get(String(id));
-          if (!callback) return;
-          __timers.delete(String(id));
-          callback();
-        }
-        async function yield_control() { return undefined; }
-        (async () => {
-        \(source)
-        })().then(
-          value => __swiftComplete(JSON.stringify({value: __normalize(value), outputs: __outputs, store: __store})),
-          error => {
-            if (String(error && error.message) === '__CODE_MODE_EXIT__') {
-              __swiftComplete(JSON.stringify({value: null, outputs: __outputs, store: __store}));
-            } else {
-              __swiftComplete(JSON.stringify({error: String(error), outputs: __outputs, store: __store}));
-            }
-          }
-        );
-        """
-    }
+  private func mergeStoreIfNeeded(cellID: String, completion: CodeModeCompletion) {
+    guard var cell = cells[cellID], !cell.storeMerged else { return }
+    var store = sessionStores[cell.threadID] ?? [:]
+    for key in completion.storeDeletes { store.removeValue(forKey: key) }
+    for (key, value) in completion.storeWrites { store[key] = value }
+    sessionStores[cell.threadID] = store
+    cell.storeMerged = true
+    cells[cellID] = cell
+  }
 
-    private static func parseJSON(_ text: String) -> JSONValue? {
-        guard let data = text.data(using: .utf8) else { return nil }
-        return try? JSONDecoder.codex.decode(JSONValue.self, from: data)
-    }
+  private func enforceCellLimit(_ maximum: Int) {
+    let maximum = max(1, maximum)
+    guard cells.count >= maximum,
+      let oldest = cells.min(by: { $0.value.createdAt < $1.value.createdAt })
+    else { return }
+    oldest.value.session.terminate()
+    cells.removeValue(forKey: oldest.key)
+    diagnostics(
+      CodeModeDiagnostic(
+        kind: .cellEvicted,
+        cellID: oldest.key,
+        threadID: oldest.value.threadID,
+        state: .terminated,
+        message: "Maximum concurrent code-mode cell count reached."
+      ))
+  }
 
-    private static func jsonString(_ value: JSONValue) -> String? {
-        guard let data = try? JSONEncoder.codexCompact.encode(value) else { return nil }
-        return String(data: data, encoding: .utf8)
-    }
+  private static func jsonString(_ value: JSONValue) -> String? {
+    guard let data = try? JSONEncoder.codexCompact.encode(value) else { return nil }
+    return String(data: data, encoding: .utf8)
+  }
 }

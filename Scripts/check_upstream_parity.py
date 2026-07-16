@@ -239,6 +239,40 @@ def validate_tool_mode(contract: dict[str, Any], sources: dict[str, bytes]) -> N
     print(f"OK tool-mode schema: {', '.join(wire_values)}")
 
 
+def validate_raw_response_usage(
+    contract: dict[str, Any], sources: dict[str, bytes]
+) -> None:
+    source_name = contract.get("source")
+    require(
+        source_name in sources,
+        f"raw-response contract references unknown source {source_name!r}",
+    )
+    try:
+        schema = json.loads(sources[source_name])
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ParityError(f"raw-response source is not valid JSON: {error}") from error
+
+    breakdown = schema.get("definitions", {}).get("TokenUsageBreakdown", {})
+    properties = breakdown.get("properties")
+    require(
+        isinstance(properties, dict),
+        "raw-response schema has no TokenUsageBreakdown properties",
+    )
+    expected_fields = contract.get("fields")
+    require(
+        isinstance(expected_fields, list) and expected_fields,
+        "raw-response contract has no usage fields",
+    )
+    for field in expected_fields:
+        require(field in properties, f"raw-response usage no longer declares {field!r}")
+    cache_write = properties.get("cacheWriteInputTokens", {})
+    require(
+        cache_write.get("type") == "integer" and cache_write.get("default") == 0,
+        "cacheWriteInputTokens must remain an integer defaulting to zero",
+    )
+    print(f"OK raw-response usage: {', '.join(expected_fields)}")
+
+
 def upstream_head(repository: str, branch: str) -> str:
     try:
         result = subprocess.run(
@@ -269,6 +303,9 @@ def main() -> int:
         sources = fetch_pinned_sources(manifest)
         validate_catalog(manifest["contracts"]["model_catalog"], sources)
         validate_tool_mode(manifest["contracts"]["tool_mode"], sources)
+        validate_raw_response_usage(
+            manifest["contracts"]["raw_response_usage"], sources
+        )
 
         if args.check_upstream_head:
             upstream = manifest["upstream"]
