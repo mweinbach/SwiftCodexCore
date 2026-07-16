@@ -40,17 +40,50 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     private let options: Options
     private let session: URLSession
     private let modelsManager: OpenAIModelsManager?
+    private let transportPolicy: ResponsesTransportPolicy
+    private let diagnostics: ResponsesTransportDiagnosticsHandler
+    private let sleeper: @Sendable (TimeInterval) async throws -> Void
 
-    public init(
+    public convenience init(
         auth: any AuthorizationProvider,
         options: Options = Options(),
         session: URLSession = .shared,
-        modelsManager: OpenAIModelsManager? = nil
+        modelsManager: OpenAIModelsManager? = nil,
+        transportPolicy: ResponsesTransportPolicy = .default,
+        diagnostics: @escaping ResponsesTransportDiagnosticsHandler = { _ in }
+    ) {
+        self.init(
+            auth: auth,
+            options: options,
+            session: session,
+            modelsManager: modelsManager,
+            transportPolicy: transportPolicy,
+            diagnostics: diagnostics,
+            sleeper: { delay in
+                try Task.checkCancellation()
+                guard delay > 0 else { return }
+                let nanoseconds = UInt64(min(delay * 1_000_000_000, Double(UInt64.max)))
+                try await Task.sleep(nanoseconds: nanoseconds)
+            }
+        )
+    }
+
+    init(
+        auth: any AuthorizationProvider,
+        options: Options = Options(),
+        session: URLSession = .shared,
+        modelsManager: OpenAIModelsManager? = nil,
+        transportPolicy: ResponsesTransportPolicy = .default,
+        diagnostics: @escaping ResponsesTransportDiagnosticsHandler = { _ in },
+        sleeper: @escaping @Sendable (TimeInterval) async throws -> Void
     ) {
         self.auth = auth
         self.options = options
         self.session = session
         self.modelsManager = modelsManager
+        self.transportPolicy = transportPolicy
+        self.diagnostics = diagnostics
+        self.sleeper = sleeper
     }
 
     public var supportsResponseContinuation: Bool {
@@ -71,13 +104,16 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
                     if contentType.contains("text/event-stream") {
                         try await Self.parseSSE(bytes: bytes, continuation: continuation)
                     } else {
-                        var data = Data()
-                        for try await byte in bytes { data.append(byte) }
+                        let data = try await collectBody(bytes)
                         try Self.parseJSONResponse(data: data, continuation: continuation)
                     }
                     continuation.finish()
                 } catch {
-                    continuation.finish(throwing: error)
+                    if Self.isCancellation(error) {
+                        continuation.finish(throwing: CancellationError())
+                    } else {
+                        continuation.finish(throwing: error)
+                    }
                 }
             }
             continuation.onTermination = { @Sendable _ in task.cancel() }
@@ -151,24 +187,134 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         try eventsFromResponseObject(snapshot.raw)
     }
 
-    private func send(_ request: ResponsesRequest, allowRefresh: Bool) async throws -> (URLSession.AsyncBytes, HTTPURLResponse) {
-        let (bytes, response) = try await session.bytes(for: try makeURLRequest(request))
-        guard let http = response as? HTTPURLResponse else {
-            throw CodexCoreError.transportError("Responses API did not return an HTTP response")
-        }
-        if http.statusCode == 401, allowRefresh, let refreshing = auth as? any TokenRefreshingAuthorizationProvider {
-            _ = try await collectBody(bytes)
-            try await refreshing.refreshNow()
-            return try await send(request, allowRefresh: false)
-        }
-        guard (200..<300).contains(http.statusCode) else {
-            let data = try await collectBody(bytes)
-            throw CodexCoreError.transportError("Responses API HTTP \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "")")
-        }
-        return (bytes, http)
+    private struct RequestIdentity {
+        var requestID: String
+        var idempotencyKey: String?
     }
 
-    private func makeURLRequest(_ request: ResponsesRequest) async throws -> URLRequest {
+    private func send(_ request: ResponsesRequest, allowRefresh: Bool) async throws -> (URLSession.AsyncBytes, HTTPURLResponse) {
+        let method = "POST"
+        let url = options.endpoint
+        let identity = makeRequestIdentity(method: method)
+        var canRefresh = allowRefresh
+        var completedRetryCount = 0
+        var attempt = 0
+
+        while true {
+            try Task.checkCancellation()
+            attempt += 1
+
+            let urlRequest: URLRequest
+            do {
+                urlRequest = try await makeURLRequest(request, identity: identity)
+            } catch {
+                try Self.throwIfCancellation(error)
+                emitFailure(error, identity: identity, method: method, url: url, attempt: attempt)
+                throw error
+            }
+
+            let result: (URLSession.AsyncBytes, URLResponse)
+            do {
+                result = try await session.bytes(for: urlRequest)
+            } catch {
+                try Self.throwIfCancellation(error)
+                emitFailure(error, identity: identity, method: method, url: url, attempt: attempt)
+                throw error
+            }
+            try Task.checkCancellation()
+
+            let (bytes, response) = result
+            guard let http = response as? HTTPURLResponse else {
+                let error = CodexCoreError.transportError("Responses API did not return an HTTP response")
+                emitFailure(error, identity: identity, method: method, url: url, attempt: attempt)
+                throw error
+            }
+
+            if http.statusCode == 401,
+               canRefresh,
+               let refreshing = auth as? any TokenRefreshingAuthorizationProvider {
+                do {
+                    _ = try await collectBody(bytes)
+                    try Task.checkCancellation()
+                    try await refreshing.refreshNow()
+                } catch {
+                    try Self.throwIfCancellation(error)
+                    emitFailure(
+                        error,
+                        http: http,
+                        identity: identity,
+                        method: method,
+                        url: url,
+                        attempt: attempt
+                    )
+                    throw error
+                }
+                canRefresh = false
+                continue
+            }
+
+            guard !(200..<300).contains(http.statusCode) else {
+                return (bytes, http)
+            }
+
+            let data: Data
+            do {
+                data = try await collectBody(bytes)
+            } catch {
+                try Self.throwIfCancellation(error)
+                emitFailure(
+                    error,
+                    http: http,
+                    identity: identity,
+                    method: method,
+                    url: url,
+                    attempt: attempt
+                )
+                throw error
+            }
+            try Task.checkCancellation()
+            let retryDelay = retryDelay(
+                for: http,
+                completedRetryCount: completedRetryCount
+            )
+            emitRateLimitIfNeeded(
+                http,
+                retryDelay: retryDelay,
+                identity: identity,
+                method: method,
+                url: url,
+                attempt: attempt
+            )
+
+            if let retryDelay {
+                completedRetryCount += 1
+                emitRetry(
+                    http,
+                    delay: retryDelay,
+                    identity: identity,
+                    method: method,
+                    url: url,
+                    attempt: attempt
+                )
+                try await sleeper(retryDelay)
+                try Task.checkCancellation()
+                continue
+            }
+
+            let error = Self.httpError(statusCode: http.statusCode, data: data)
+            emitFailure(
+                error,
+                http: http,
+                identity: identity,
+                method: method,
+                url: url,
+                attempt: attempt
+            )
+            throw error
+        }
+    }
+
+    private func makeURLRequest(_ request: ResponsesRequest, identity: RequestIdentity) async throws -> URLRequest {
         var request = request
         if !options.sendsMetadata {
             request.metadata = [:]
@@ -180,7 +326,8 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
             method: "POST",
             url: options.endpoint,
             body: JSONEncoder.codexCompact.encode(request),
-            accept: "text/event-stream, application/json"
+            accept: "text/event-stream, application/json",
+            identity: identity
         )
         if request.multiAgent?.enabled == true {
             let beta = "responses_multi_agent=v1"
@@ -193,22 +340,121 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     }
 
     private func sendData(method: String, url: URL, body: Data?, accept: String, allowRefresh: Bool) async throws -> Data {
-        let request = try await makeURLRequest(method: method, url: url, body: body, accept: accept)
-        let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw CodexCoreError.transportError("Responses API did not return an HTTP response")
+        let identity = makeRequestIdentity(method: method)
+        var canRefresh = allowRefresh
+        var completedRetryCount = 0
+        var attempt = 0
+
+        while true {
+            try Task.checkCancellation()
+            attempt += 1
+
+            let request: URLRequest
+            do {
+                request = try await makeURLRequest(
+                    method: method,
+                    url: url,
+                    body: body,
+                    accept: accept,
+                    identity: identity
+                )
+            } catch {
+                try Self.throwIfCancellation(error)
+                emitFailure(error, identity: identity, method: method, url: url, attempt: attempt)
+                throw error
+            }
+
+            let result: (Data, URLResponse)
+            do {
+                result = try await session.data(for: request)
+            } catch {
+                try Self.throwIfCancellation(error)
+                emitFailure(error, identity: identity, method: method, url: url, attempt: attempt)
+                throw error
+            }
+            try Task.checkCancellation()
+
+            let (data, response) = result
+            guard let http = response as? HTTPURLResponse else {
+                let error = CodexCoreError.transportError("Responses API did not return an HTTP response")
+                emitFailure(error, identity: identity, method: method, url: url, attempt: attempt)
+                throw error
+            }
+
+            if http.statusCode == 401,
+               canRefresh,
+               let refreshing = auth as? any TokenRefreshingAuthorizationProvider {
+                do {
+                    try Task.checkCancellation()
+                    try await refreshing.refreshNow()
+                } catch {
+                    try Self.throwIfCancellation(error)
+                    emitFailure(
+                        error,
+                        http: http,
+                        identity: identity,
+                        method: method,
+                        url: url,
+                        attempt: attempt
+                    )
+                    throw error
+                }
+                canRefresh = false
+                continue
+            }
+
+            guard !(200..<300).contains(http.statusCode) else {
+                return data
+            }
+
+            let retryDelay = retryDelay(
+                for: http,
+                completedRetryCount: completedRetryCount
+            )
+            emitRateLimitIfNeeded(
+                http,
+                retryDelay: retryDelay,
+                identity: identity,
+                method: method,
+                url: url,
+                attempt: attempt
+            )
+
+            if let retryDelay {
+                completedRetryCount += 1
+                emitRetry(
+                    http,
+                    delay: retryDelay,
+                    identity: identity,
+                    method: method,
+                    url: url,
+                    attempt: attempt
+                )
+                try await sleeper(retryDelay)
+                try Task.checkCancellation()
+                continue
+            }
+
+            let error = Self.httpError(statusCode: http.statusCode, data: data)
+            emitFailure(
+                error,
+                http: http,
+                identity: identity,
+                method: method,
+                url: url,
+                attempt: attempt
+            )
+            throw error
         }
-        if http.statusCode == 401, allowRefresh, let refreshing = auth as? any TokenRefreshingAuthorizationProvider {
-            try await refreshing.refreshNow()
-            return try await sendData(method: method, url: url, body: body, accept: accept, allowRefresh: false)
-        }
-        guard (200..<300).contains(http.statusCode) else {
-            throw CodexCoreError.transportError("Responses API HTTP \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "")")
-        }
-        return data
     }
 
-    private func makeURLRequest(method: String, url: URL, body: Data?, accept: String) async throws -> URLRequest {
+    private func makeURLRequest(
+        method: String,
+        url: URL,
+        body: Data?,
+        accept: String,
+        identity: RequestIdentity
+    ) async throws -> URLRequest {
         var urlRequest = URLRequest(url: url, timeoutInterval: options.requestTimeout)
         urlRequest.httpMethod = method
         urlRequest.setValue(accept, forHTTPHeaderField: "Accept")
@@ -219,8 +465,171 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
             }
         }
         for (key, value) in try await auth.authorizationHeaders() { urlRequest.setValue(value, forHTTPHeaderField: key) }
+        urlRequest.setValue(identity.requestID, forHTTPHeaderField: "X-Client-Request-Id")
+        if let idempotencyKey = identity.idempotencyKey {
+            urlRequest.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
+        }
         for (key, value) in options.extraHeaders { urlRequest.setValue(value, forHTTPHeaderField: key) }
         return urlRequest
+    }
+
+    private func makeRequestIdentity(method: String) -> RequestIdentity {
+        let configuredRequestID = configuredHeaderValue(named: "X-Client-Request-Id")
+            .flatMap { $0.isEmpty ? nil : $0 }
+        let configuredIdempotencyKey = configuredHeaderValue(named: "Idempotency-Key")
+            .flatMap { $0.isEmpty ? nil : $0 }
+        return RequestIdentity(
+            requestID: configuredRequestID ?? UUID().uuidString,
+            idempotencyKey: method.uppercased() == "POST"
+                ? (configuredIdempotencyKey ?? UUID().uuidString)
+                : nil
+        )
+    }
+
+    private func configuredHeaderValue(named name: String) -> String? {
+        options.extraHeaders.first { key, _ in
+            key.caseInsensitiveCompare(name) == .orderedSame
+        }?.value
+    }
+
+    private func retryDelay(
+        for response: HTTPURLResponse,
+        completedRetryCount: Int
+    ) -> TimeInterval? {
+        guard Self.isRetryableStatus(response.statusCode),
+              completedRetryCount < max(0, transportPolicy.maximumRetryCount) else {
+            return nil
+        }
+        return transportPolicy.delay(
+            forRetry: completedRetryCount + 1,
+            retryAfter: Self.retryAfterDelay(from: response)
+        )
+    }
+
+    private func emitRateLimitIfNeeded(
+        _ response: HTTPURLResponse,
+        retryDelay: TimeInterval?,
+        identity: RequestIdentity,
+        method: String,
+        url: URL,
+        attempt: Int
+    ) {
+        guard response.statusCode == 429 else { return }
+        diagnostics(ResponsesTransportDiagnostic(
+            kind: .rateLimited,
+            requestID: identity.requestID,
+            idempotencyKey: identity.idempotencyKey,
+            method: method,
+            url: url,
+            attempt: attempt,
+            statusCode: response.statusCode,
+            serverRequestID: Self.serverRequestID(from: response),
+            retryDelay: retryDelay,
+            message: "Responses API rate limited the request"
+        ))
+    }
+
+    private func emitRetry(
+        _ response: HTTPURLResponse,
+        delay: TimeInterval,
+        identity: RequestIdentity,
+        method: String,
+        url: URL,
+        attempt: Int
+    ) {
+        diagnostics(ResponsesTransportDiagnostic(
+            kind: .retryScheduled,
+            requestID: identity.requestID,
+            idempotencyKey: identity.idempotencyKey,
+            method: method,
+            url: url,
+            attempt: attempt,
+            statusCode: response.statusCode,
+            serverRequestID: Self.serverRequestID(from: response),
+            retryDelay: delay,
+            message: "Retrying Responses API request after HTTP \(response.statusCode)"
+        ))
+    }
+
+    private func emitFailure(
+        _ error: Error,
+        http: HTTPURLResponse? = nil,
+        identity: RequestIdentity,
+        method: String,
+        url: URL,
+        attempt: Int
+    ) {
+        diagnostics(ResponsesTransportDiagnostic(
+            kind: .requestFailed,
+            requestID: identity.requestID,
+            idempotencyKey: identity.idempotencyKey,
+            method: method,
+            url: url,
+            attempt: attempt,
+            statusCode: http?.statusCode,
+            serverRequestID: http.flatMap(Self.serverRequestID),
+            retryDelay: nil,
+            message: String(describing: error)
+        ))
+    }
+
+    private static func isRetryableStatus(_ statusCode: Int) -> Bool {
+        statusCode == 429 || (500..<600).contains(statusCode)
+    }
+
+    private static func retryAfterDelay(from response: HTTPURLResponse) -> TimeInterval? {
+        if let milliseconds = response.value(forHTTPHeaderField: "Retry-After-Ms")
+            .flatMap(Double.init),
+           milliseconds >= 0 {
+            return milliseconds / 1_000
+        }
+
+        guard let value = response.value(forHTTPHeaderField: "Retry-After")?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            return nil
+        }
+        if let seconds = Double(value), seconds >= 0 {
+            return seconds
+        }
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        for format in [
+            "EEE, dd MMM yyyy HH:mm:ss zzz",
+            "EEEE, dd-MMM-yy HH:mm:ss zzz",
+            "EEE MMM d HH:mm:ss yyyy"
+        ] {
+            formatter.dateFormat = format
+            if let date = formatter.date(from: value) {
+                return max(0, date.timeIntervalSinceNow)
+            }
+        }
+        return nil
+    }
+
+    private static func serverRequestID(from response: HTTPURLResponse) -> String? {
+        response.value(forHTTPHeaderField: "X-Request-Id")
+            ?? response.value(forHTTPHeaderField: "Request-Id")
+    }
+
+    private static func httpError(statusCode: Int, data: Data) -> CodexCoreError {
+        CodexCoreError.transportError(
+            "Responses API HTTP \(statusCode): \(String(data: data, encoding: .utf8) ?? "")"
+        )
+    }
+
+    private static func isCancellation(_ error: Error) -> Bool {
+        error is CancellationError
+            || (error as? URLError)?.code == .cancelled
+            || Task.isCancelled
+    }
+
+    private static func throwIfCancellation(_ error: Error) throws {
+        if isCancellation(error) {
+            throw CancellationError()
+        }
     }
 
     private func responseURL(id: String) -> URL {
@@ -229,7 +638,15 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
 
     private func collectBody(_ bytes: URLSession.AsyncBytes) async throws -> Data {
         var data = Data()
-        for try await byte in bytes { data.append(byte) }
+        var byteCount = 0
+        for try await byte in bytes {
+            data.append(byte)
+            byteCount += 1
+            if byteCount.isMultiple(of: 4_096) {
+                try Task.checkCancellation()
+            }
+        }
+        try Task.checkCancellation()
         return data
     }
 
@@ -242,7 +659,12 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     private static func parseSSE(bytes: URLSession.AsyncBytes, continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation) async throws {
         var line = Data()
         var state = SSEParserState()
+        var byteCount = 0
         for try await byte in bytes {
+            byteCount += 1
+            if byteCount.isMultiple(of: 4_096) {
+                try Task.checkCancellation()
+            }
             if byte == 0x0A {
                 if line.last == 0x0D { line.removeLast() }
                 guard let text = String(data: line, encoding: .utf8) else {
@@ -254,6 +676,7 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
                 line.append(byte)
             }
         }
+        try Task.checkCancellation()
         if !line.isEmpty {
             if line.last == 0x0D { line.removeLast() }
             guard let text = String(data: line, encoding: .utf8) else {
