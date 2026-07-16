@@ -3,7 +3,7 @@
   "upstream": {
     "repository": "https://github.com/openai/codex.git",
     "branch": "main",
-    "commit": "1d941253e9354fe583a033660a6288df66e27488"
+    "commit": "cbc83d961e8132bfff4d340ab8342d181b79e95e"
   },
   "sources": {
     "model_catalog": {
@@ -21,6 +21,10 @@
     "raw_response_schema": {
       "path": "codex-rs/app-server-protocol/schema/json/v2/RawResponseCompletedNotification.json",
       "sha256": "dab430b6c6e2ebb51d1fa2acdc597418ce68b12710382d4d93b652efd47fb61a"
+    },
+    "protocol_models": {
+      "path": "codex-rs/protocol/src/models.rs",
+      "sha256": "752b1d80e932ef9b662647d5bdbbdfb0e7203c6e62feec18f4e7332bbafc5b78"
     }
   },
   "contracts": {
@@ -188,6 +192,14 @@
         "outputTokens",
         "reasoningOutputTokens",
         "totalTokens"
+      ]
+    },
+    "mcp_encrypted_content": {
+      "source": "protocol_models",
+      "snippets": [
+        "codex/encryptedContent",
+        "FunctionCallOutputContentItem::EncryptedContent",
+        "FunctionCallOutputBody::ContentItems"
       ]
     }
   }

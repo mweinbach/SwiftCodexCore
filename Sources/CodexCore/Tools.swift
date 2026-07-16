@@ -110,11 +110,11 @@ public struct ToolResult: Codable, Sendable, Equatable {
     return String(data: data, encoding: .utf8) ?? content
   }
 
-  /// Responses accepts either a string or `input_text`/`input_image` content
-  /// items for function and custom tool outputs.
+  /// Responses accepts either a string or typed input/encrypted content items
+  /// for function and custom tool outputs.
   public var responseOutputValue: JSONValue {
     guard let contentBlocks,
-      contentBlocks.contains(where: { $0.type != "text" })
+      contentBlocks.contains(where: { $0.type != "text" || $0.isEncryptedContent })
     else { return .string(content) }
     let mapped = contentBlocks.compactMap { block in
       block.responseOutputItem.map { (block, $0) }
@@ -125,7 +125,9 @@ public struct ToolResult: Codable, Sendable, Equatable {
     let blockText = contentBlocks.compactMap { $0.fields["text"]?.stringValue }.joined(
       separator: "\n")
     if !content.isEmpty, content != blockText {
-      var output = mapped.compactMap { block, item in block.type == "text" ? nil : item }
+      var output = mapped.compactMap { block, item in
+        block.type == "text" && !block.isEncryptedContent ? nil : item
+      }
       output.append(.object(["type": .string("input_text"), "text": .string(content)]))
       return .array(output)
     }
@@ -148,6 +150,9 @@ public struct ToolResult: Codable, Sendable, Equatable {
 public struct ToolContentBlock: Codable, Sendable, Equatable {
   public var fields: [String: JSONValue]
   public var type: String { fields["type"]?.stringValue ?? "unknown" }
+  public var isEncryptedContent: Bool {
+    type == "text" && fields["_meta"]?["codex/encryptedContent"]?.boolValue == true
+  }
 
   public init(fields: [String: JSONValue]) { self.fields = fields }
 
@@ -191,6 +196,12 @@ public struct ToolContentBlock: Codable, Sendable, Equatable {
     switch type {
     case "text":
       guard let text = fields["text"]?.stringValue else { return nil }
+      if isEncryptedContent {
+        return .object([
+          "type": .string("encrypted_content"),
+          "encrypted_content": .string(text),
+        ])
+      }
       return .object(["type": .string("input_text"), "text": .string(text)])
     case "image":
       let imageURL: String?

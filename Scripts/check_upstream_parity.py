@@ -273,6 +273,31 @@ def validate_raw_response_usage(
     print(f"OK raw-response usage: {', '.join(expected_fields)}")
 
 
+def validate_mcp_encrypted_content(
+    contract: dict[str, Any], sources: dict[str, bytes]
+) -> None:
+    source_name = contract.get("source")
+    require(
+        source_name in sources,
+        f"MCP encrypted-content contract references unknown source {source_name!r}",
+    )
+    try:
+        source = sources[source_name].decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ParityError(f"MCP encrypted-content source is not UTF-8: {error}") from error
+    snippets = contract.get("snippets")
+    require(
+        isinstance(snippets, list) and snippets,
+        "MCP encrypted-content contract has no snippets",
+    )
+    for snippet in snippets:
+        require(
+            isinstance(snippet, str) and snippet in source,
+            f"MCP encrypted-content source no longer contains {snippet!r}",
+        )
+    print("OK MCP encrypted-content output contract")
+
+
 def upstream_head(repository: str, branch: str) -> str:
     try:
         result = subprocess.run(
@@ -305,6 +330,9 @@ def main() -> int:
         validate_tool_mode(manifest["contracts"]["tool_mode"], sources)
         validate_raw_response_usage(
             manifest["contracts"]["raw_response_usage"], sources
+        )
+        validate_mcp_encrypted_content(
+            manifest["contracts"]["mcp_encrypted_content"], sources
         )
 
         if args.check_upstream_head:

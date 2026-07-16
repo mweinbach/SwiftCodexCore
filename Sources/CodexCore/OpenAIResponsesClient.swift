@@ -11,19 +11,24 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     public var requestTimeout: TimeInterval
     public var sendsMetadata: Bool
     public var supportsResponseContinuation: Bool
+    /// Provider-level gate for Responses WebSocket transport. A request also
+    /// needs dynamic model metadata with `prefer_websockets: true`.
+    public var supportsWebSockets: Bool
 
     public init(
       endpoint: URL = URL(string: "https://api.openai.com/v1/responses")!,
       extraHeaders: [String: String] = [:],
       requestTimeout: TimeInterval = 600,
       sendsMetadata: Bool = true,
-      supportsResponseContinuation: Bool = true
+      supportsResponseContinuation: Bool = true,
+      supportsWebSockets: Bool = true
     ) {
       self.endpoint = endpoint
       self.extraHeaders = extraHeaders
       self.requestTimeout = requestTimeout
       self.sendsMetadata = sendsMetadata
       self.supportsResponseContinuation = supportsResponseContinuation
+      self.supportsWebSockets = supportsWebSockets
     }
 
     public static var openAIPlatform: Options {
@@ -46,6 +51,8 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
   private let transportPolicy: ResponsesTransportPolicy
   private let diagnostics: ResponsesTransportDiagnosticsHandler
   private let sleeper: @Sendable (TimeInterval) async throws -> Void
+  private let webSocketFactory: any ResponsesWebSocketTaskFactory
+  private let webSocketFallbackState = ResponsesWebSocketFallbackState()
 
   public convenience init(
     auth: any AuthorizationProvider,
@@ -79,7 +86,8 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     modelsManager: OpenAIModelsManager? = nil,
     transportPolicy: ResponsesTransportPolicy = .default,
     diagnostics: @escaping ResponsesTransportDiagnosticsHandler = { _ in },
-    sleeper: @escaping @Sendable (TimeInterval) async throws -> Void
+    sleeper: @escaping @Sendable (TimeInterval) async throws -> Void,
+    webSocketFactory: (any ResponsesWebSocketTaskFactory)? = nil
   ) {
     self.auth = auth
     self.options = options
@@ -88,6 +96,8 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     self.transportPolicy = transportPolicy
     self.diagnostics = diagnostics
     self.sleeper = sleeper
+    self.webSocketFactory =
+      webSocketFactory ?? URLSessionResponsesWebSocketTaskFactory(session: session)
   }
 
   public var supportsResponseContinuation: Bool {
@@ -101,7 +111,71 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     AsyncThrowingStream { continuation in
       let task = Task {
         let state = RequestRetryState(identity: makeRequestIdentity(method: "POST"))
-        var yieldedETags = Set<String>()
+        let yieldedETags = StreamETagTracker()
+
+        if await shouldUseWebSocket(for: request) {
+          var canRefresh = true
+          while true {
+            let tracker = StreamEventTracker()
+            do {
+              try await streamWebSocket(
+                request,
+                state: state,
+                continuation: continuation,
+                tracker: tracker,
+                yieldedETags: yieldedETags
+              )
+              continuation.finish()
+              return
+            } catch {
+              if Self.isCancellation(error) {
+                continuation.finish(throwing: CancellationError())
+                return
+              }
+              if !tracker.didYieldSemanticEvent,
+                (error as? ResponsesWebSocketError)?.statusCode == 401,
+                canRefresh,
+                let refreshing = auth as? any TokenRefreshingAuthorizationProvider
+              {
+                do {
+                  try await refreshing.refreshNow()
+                  try Task.checkCancellation()
+                  canRefresh = false
+                  continue
+                } catch {
+                  if Self.isCancellation(error) {
+                    continuation.finish(throwing: CancellationError())
+                  } else {
+                    continuation.finish(throwing: error)
+                  }
+                  return
+                }
+              }
+              if !tracker.didYieldSemanticEvent {
+                webSocketFallbackState.disable()
+                emitRetry(
+                  error,
+                  delay: 0,
+                  identity: state.identity,
+                  method: "POST",
+                  url: options.endpoint,
+                  attempt: max(1, state.attempt)
+                )
+                break
+              }
+              emitFailure(
+                error,
+                identity: state.identity,
+                method: "POST",
+                url: options.endpoint,
+                attempt: max(1, state.attempt)
+              )
+              continuation.finish(throwing: error)
+              return
+            }
+          }
+        }
+
         while true {
           let tracker = StreamEventTracker()
           do {
@@ -111,7 +185,7 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
               state: state
             )
             if let etag = http.value(forHTTPHeaderField: "X-Models-Etag"),
-              yieldedETags.insert(etag).inserted
+              yieldedETags.insert(etag)
             {
               await modelsManager?.refreshIfNewETag(etag)
               continuation.yield(.modelCatalogETag(etag))
@@ -289,10 +363,146 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     }
   }
 
+  private final class StreamETagTracker: @unchecked Sendable {
+    private var values = Set<String>()
+
+    func insert(_ value: String) -> Bool {
+      values.insert(value).inserted
+    }
+  }
+
   private struct InterruptedResponseStreamError: Error, CustomStringConvertible {
     var description: String {
       "Responses stream ended before response.completed"
     }
+  }
+
+  private func shouldUseWebSocket(for request: ResponsesRequest) async -> Bool {
+    guard options.supportsWebSockets,
+      request.stream,
+      request.background != true,
+      !webSocketFallbackState.isDisabled,
+      let modelsManager
+    else {
+      return false
+    }
+    let catalog = await modelsManager.catalog(.offline)
+    return catalog.model(id: request.model)?.prefersWebSockets == true
+  }
+
+  private func streamWebSocket(
+    _ request: ResponsesRequest,
+    state retryState: RequestRetryState,
+    continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation,
+    tracker: StreamEventTracker,
+    yieldedETags: StreamETagTracker
+  ) async throws {
+    retryState.attempt += 1
+    let normalized = normalizedRequest(request)
+    let urlRequest = try await makeWebSocketURLRequest(
+      normalized,
+      identity: retryState.identity
+    )
+    let webSocket = webSocketFactory.makeTask(
+      with: urlRequest,
+      maximumMessageSize: 64 * 1_024 * 1_024
+    )
+    webSocket.resume()
+
+    do {
+      try await withTaskCancellationHandler {
+        try await webSocket.send(.text(try webSocketPayload(normalized)))
+        if let http = webSocket.response as? HTTPURLResponse,
+          let etag = http.value(forHTTPHeaderField: "X-Models-Etag"),
+          yieldedETags.insert(etag)
+        {
+          await modelsManager?.refreshIfNewETag(etag)
+          continuation.yield(.modelCatalogETag(etag))
+        }
+
+        var state = SSEParserState()
+        while !tracker.didReachTerminalEvent {
+          try Task.checkCancellation()
+          let message = try await webSocket.receive()
+          guard case .text(let text) = message else {
+            throw ResponsesWebSocketError.unsupportedMessage
+          }
+          guard let data = text.data(using: .utf8) else {
+            throw CodexCoreError.invalidJSON("WebSocket response was not UTF-8")
+          }
+          let json = try JSONDecoder.codex.decode(JSONValue.self, from: data)
+          let type = json["type"]?.stringValue ?? ""
+          for event in try Self.eventsFromStreamObject(json, type: type, state: &state) {
+            tracker.record(event)
+            continuation.yield(event)
+          }
+        }
+      } onCancel: {
+        webSocket.cancel()
+      }
+      webSocket.cancel()
+      guard tracker.didReachTerminalEvent else {
+        throw ResponsesWebSocketError.endedBeforeCompletion
+      }
+    } catch {
+      webSocket.cancel()
+      try Self.throwIfCancellation(error)
+      let statusCode = (webSocket.response as? HTTPURLResponse)?.statusCode
+      throw ResponsesWebSocketError.attemptFailed(
+        underlying: error,
+        statusCode: statusCode
+      )
+    }
+  }
+
+  private func webSocketPayload(_ request: ResponsesRequest) throws -> String {
+    let encoded = try JSONEncoder.codexCompact.encode(request)
+    let value = try JSONDecoder.codex.decode(JSONValue.self, from: encoded)
+    guard case .object(var fields) = value else {
+      throw CodexCoreError.invalidJSON("Responses request did not encode as an object")
+    }
+    fields["type"] = .string("response.create")
+    let payload = try JSONEncoder.codexCompact.encode(JSONValue.object(fields))
+    guard let text = String(data: payload, encoding: .utf8) else {
+      throw CodexCoreError.invalidJSON("Responses request was not UTF-8")
+    }
+    return text
+  }
+
+  private func makeWebSocketURLRequest(
+    _ request: ResponsesRequest,
+    identity: RequestIdentity
+  ) async throws -> URLRequest {
+    let endpoint = try Self.webSocketURL(from: options.endpoint)
+    var urlRequest = try await makeURLRequest(
+      method: "GET",
+      url: endpoint,
+      body: nil,
+      accept: "application/json",
+      identity: identity,
+      useResponsesLite: request.useResponsesLite
+    )
+    Self.appendBeta("responses_websockets=2026-02-06", to: &urlRequest)
+    if request.multiAgent?.enabled == true {
+      Self.appendBeta("responses_multi_agent=v1", to: &urlRequest)
+    }
+    return urlRequest
+  }
+
+  private static func webSocketURL(from endpoint: URL) throws -> URL {
+    guard var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
+      throw ResponsesWebSocketError.invalidEndpoint(endpoint)
+    }
+    switch components.scheme?.lowercased() {
+    case "https": components.scheme = "wss"
+    case "http": components.scheme = "ws"
+    case "wss", "ws": break
+    default: throw ResponsesWebSocketError.invalidEndpoint(endpoint)
+    }
+    guard let url = components.url else {
+      throw ResponsesWebSocketError.invalidEndpoint(endpoint)
+    }
+    return url
   }
 
   private func send(
@@ -425,13 +635,7 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
   private func makeURLRequest(_ request: ResponsesRequest, identity: RequestIdentity) async throws
     -> URLRequest
   {
-    var request = request
-    if !options.sendsMetadata {
-      request.metadata = [:]
-    }
-    if !options.supportsResponseContinuation {
-      request.previousResponseID = nil
-    }
+    let request = normalizedRequest(request)
     var urlRequest = try await makeURLRequest(
       method: "POST",
       url: options.endpoint,
@@ -441,16 +645,30 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
       useResponsesLite: request.useResponsesLite
     )
     if request.multiAgent?.enabled == true {
-      let beta = "responses_multi_agent=v1"
-      let current = urlRequest.value(forHTTPHeaderField: "OpenAI-Beta") ?? ""
-      if !current.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }).contains(
-        beta)
-      {
-        urlRequest.setValue(
-          current.isEmpty ? beta : "\(current), \(beta)", forHTTPHeaderField: "OpenAI-Beta")
-      }
+      Self.appendBeta("responses_multi_agent=v1", to: &urlRequest)
     }
     return urlRequest
+  }
+
+  private func normalizedRequest(_ request: ResponsesRequest) -> ResponsesRequest {
+    var request = request
+    if !options.sendsMetadata {
+      request.metadata = [:]
+    }
+    if !options.supportsResponseContinuation {
+      request.previousResponseID = nil
+    }
+    return request
+  }
+
+  private static func appendBeta(_ beta: String, to request: inout URLRequest) {
+    let current = request.value(forHTTPHeaderField: "OpenAI-Beta") ?? ""
+    let values = current.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+    guard !values.contains(beta) else { return }
+    request.setValue(
+      current.isEmpty ? beta : "\(current), \(beta)",
+      forHTTPHeaderField: "OpenAI-Beta"
+    )
   }
 
   private func sendData(
