@@ -39,11 +39,18 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     private let auth: any AuthorizationProvider
     private let options: Options
     private let session: URLSession
+    private let modelsManager: OpenAIModelsManager?
 
-    public init(auth: any AuthorizationProvider, options: Options = Options(), session: URLSession = .shared) {
+    public init(
+        auth: any AuthorizationProvider,
+        options: Options = Options(),
+        session: URLSession = .shared,
+        modelsManager: OpenAIModelsManager? = nil
+    ) {
         self.auth = auth
         self.options = options
         self.session = session
+        self.modelsManager = modelsManager
     }
 
     public var supportsResponseContinuation: Bool {
@@ -56,6 +63,10 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
             let task = Task {
                 do {
                     let (bytes, http) = try await send(request, allowRefresh: true)
+                    if let etag = http.value(forHTTPHeaderField: "X-Models-Etag") {
+                        await modelsManager?.refreshIfNewETag(etag)
+                        continuation.yield(.modelCatalogETag(etag))
+                    }
                     let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? ""
                     if contentType.contains("text/event-stream") {
                         try await Self.parseSSE(bytes: bytes, continuation: continuation)
@@ -119,6 +130,19 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
             allowRefresh: true
         )
         return try Self.parseResponseSnapshot(data: data)
+    }
+
+    /// Compacts a complete stateless Responses context into the canonical input
+    /// window to use for the next request.
+    public func compactResponse(_ request: ResponsesCompactionRequest) async throws -> ResponsesCompactionResult {
+        let data = try await sendData(
+            method: "POST",
+            url: options.endpoint.appendingPathComponent("compact"),
+            body: JSONEncoder.codexCompact.encode(request),
+            accept: "application/json",
+            allowRefresh: true
+        )
+        return try JSONDecoder.codex.decode(ResponsesCompactionResult.self, from: data)
     }
 
     /// Converts a retrieved foreground/background response snapshot into the same events

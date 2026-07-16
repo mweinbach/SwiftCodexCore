@@ -40,6 +40,10 @@ public final class TurnHandle: Sendable {
         await control.steer(TurnInput(text, metadata: metadata))
     }
 
+    public func steer(_ input: TurnInput) async {
+        await control.steer(input)
+    }
+
     public func interrupt() async {
         await control.interrupt()
     }
@@ -110,7 +114,7 @@ public final class CodexAgent: Sendable {
             turnID: turnID,
             kind: .userMessage,
             summary: initialInput.text,
-            payload: .object(["role": .string("user"), "content": .string(initialInput.text), "metadata": .object(initialInput.metadata)])
+            payload: userMessagePayload(initialInput)
         )
         try await threadManager.appendItem(userItem, to: threadID)
         continuation.yield(.itemCompleted(userItem))
@@ -138,7 +142,7 @@ public final class CodexAgent: Sendable {
                         turnID: turnID,
                         kind: .userMessage,
                         summary: steering.text,
-                        payload: .object(["role": .string("user"), "content": .string(steering.text), "metadata": .object(steering.metadata), "steering": .bool(true)])
+                        payload: userMessagePayload(steering, steering: true)
                     )
                     try await threadManager.appendItem(steeringItem, to: threadID)
                     continuation.yield(.itemCompleted(steeringItem))
@@ -146,7 +150,7 @@ public final class CodexAgent: Sendable {
                 accumulatedUserText += "\n" + steeringInputs.map(\.text).joined(separator: "\n")
                 promptAssembly = try PromptAssembler.build(configuration: configuration, userText: accumulatedUserText, threadID: threadID, turnID: turnID)
                 if nextInputUsesPreviousResponse {
-                    responseInputs.append(contentsOf: steeringInputs.map { ResponseInputBuilder.userMessage($0.text) })
+                    responseInputs.append(contentsOf: steeringInputs.map(responseInput))
                 } else {
                     responseInputs = try await buildInputItems(threadID: threadID, prefixItems: promptAssembly.inputPrefixItems)
                 }
@@ -171,7 +175,7 @@ public final class CodexAgent: Sendable {
                 store: false,
                 previousResponseID: useResponseContinuation ? lastResponseID : nil,
                 metadata: ["thread_id": .string(threadID), "turn_id": .string(turnID), "iteration": .number(Double(iteration))],
-                parallelToolCalls: true,
+                parallelToolCalls: configuration.parallelToolCalls,
                 include: configuration.responseIncludes,
                 serviceTier: configuration.serviceTier,
                 promptCacheKey: promptCacheKey,
@@ -180,7 +184,8 @@ public final class CodexAgent: Sendable {
                 maxOutputTokens: configuration.maxOutputTokens,
                 toolChoice: configuration.toolChoice,
                 text: configuration.textOptions,
-                multiAgent: configuration.multiAgent
+                multiAgent: configuration.multiAgent,
+                contextManagement: configuration.contextManagement
             )
             nextInputUsesPreviousResponse = false
 
@@ -231,7 +236,7 @@ public final class CodexAgent: Sendable {
                     let responseItemRecord = ThreadItem(
                         threadID: threadID,
                         turnID: turnID,
-                        kind: itemType == "reasoning" ? .reasoning : .dynamicToolCall,
+                        kind: itemType == "reasoning" ? .reasoning : (itemType == "compaction" ? .contextCompaction : .dynamicToolCall),
                         summary: itemType,
                         payload: .object(["item": responseItem])
                     )
@@ -239,6 +244,8 @@ public final class CodexAgent: Sendable {
                     continuation.yield(.itemCompleted(responseItemRecord))
                 case .messageCompleted(let text):
                     completedMessage = text
+                case .modelCatalogETag(let etag):
+                    continuation.yield(.modelCatalogChanged(etag: etag))
                 case .completed(let responseID, let usage):
                     lastResponseID = responseID
                     finalUsage = usage
@@ -362,10 +369,15 @@ public final class CodexAgent: Sendable {
     private func buildInputItems(threadID: String, prefixItems: [JSONValue] = []) async throws -> [JSONValue] {
         let thread = try await threadManager.getThread(id: threadID)
         var input: [JSONValue] = prefixItems
-        for item in thread.items {
+        let replayStart = thread.items.lastIndex(where: { $0.kind == .contextCompaction }) ?? thread.items.startIndex
+        for item in thread.items[replayStart...] {
             switch item.kind {
             case .userMessage:
-                if let content = item.payload["content"]?.stringValue { input.append(ResponseInputBuilder.userMessage(content)) }
+                if let blocks = item.payload["response_content"]?.arrayValue {
+                    input.append(ResponseInputBuilder.userMessage(content: blocks))
+                } else if let content = item.payload["content"]?.stringValue {
+                    input.append(ResponseInputBuilder.userMessage(content))
+                }
             case .developerMessage:
                 if let content = item.payload["content"]?.stringValue { input.append(ResponseInputBuilder.developerMessage(content)) }
             case .assistantMessage:
@@ -383,7 +395,7 @@ public final class CodexAgent: Sendable {
                         caller: nonNull(item.payload["caller"])
                     )))
                 }
-            case .dynamicToolCall, .reasoning:
+            case .dynamicToolCall, .reasoning, .contextCompaction:
                 if let responseItem = item.payload["item"],
                    let replayableItem = ResponseInputBuilder.replayableServerToolOutput(responseItem) {
                     input.append(replayableItem)
@@ -414,6 +426,25 @@ public final class CodexAgent: Sendable {
             }
         }
         return input
+    }
+
+    private func responseInput(_ input: TurnInput) -> JSONValue {
+        ResponseInputBuilder.userMessage(content: input.content ?? [ResponseInputBuilder.inputText(input.text)])
+    }
+
+    private func userMessagePayload(_ input: TurnInput, steering: Bool = false) -> JSONValue {
+        var fields: [String: JSONValue] = [
+            "role": .string("user"),
+            "content": .string(input.text),
+            "metadata": .object(input.metadata)
+        ]
+        if let content = input.content {
+            fields["response_content"] = .array(content)
+        }
+        if steering {
+            fields["steering"] = .bool(true)
+        }
+        return .object(fields)
     }
 
     private func effectivePromptCacheKey(threadID: String) async throws -> String {

@@ -10,6 +10,7 @@ public enum AgentEvent: Sendable, Equatable, CustomStringConvertible {
     case toolStarted(call: ToolCall)
     case toolCompleted(call: ToolCall, result: ToolResult)
     case approvalRequested(ApprovalRequest)
+    case modelCatalogChanged(etag: String)
     case warning(String)
     case error(String)
 
@@ -24,6 +25,7 @@ public enum AgentEvent: Sendable, Equatable, CustomStringConvertible {
         case .toolStarted(let call): return "toolStarted(\(call.name))"
         case .toolCompleted(let call, let result): return "toolCompleted(\(call.name): \(result.summary))"
         case .approvalRequested(let request): return "approvalRequested(\(request.reason))"
+        case .modelCatalogChanged(let etag): return "modelCatalogChanged(\(etag))"
         case .warning(let message): return "warning(\(message))"
         case .error(let message): return "error(\(message))"
         }

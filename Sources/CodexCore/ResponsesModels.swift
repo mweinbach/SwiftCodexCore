@@ -198,6 +198,86 @@ public struct ResponseTextOptions: Codable, Sendable, Equatable {
     }
 }
 
+/// A server-side context-management strategy. GPT-5.6 can emit an encrypted
+/// compaction item once the rendered context crosses `compactThreshold`.
+public struct ResponseContextManagement: Codable, Sendable, Equatable {
+    public var type: String
+    public var compactThreshold: Int
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case compactThreshold = "compact_threshold"
+    }
+
+    public init(type: String = "compaction", compactThreshold: Int) {
+        self.type = type
+        self.compactThreshold = compactThreshold
+    }
+}
+
+public struct ResponsesCompactionRequest: Codable, Sendable, Equatable {
+    public var model: String
+    public var input: [JSONValue]
+    public var tools: [ResponseToolDefinition]?
+    public var instructions: String?
+    public var previousResponseID: String?
+    public var promptCacheKey: String?
+    public var promptCacheRetention: String?
+    public var serviceTier: String?
+
+    enum CodingKeys: String, CodingKey {
+        case model
+        case input
+        case tools
+        case instructions
+        case previousResponseID = "previous_response_id"
+        case promptCacheKey = "prompt_cache_key"
+        case promptCacheRetention = "prompt_cache_retention"
+        case serviceTier = "service_tier"
+    }
+
+    public init(
+        model: String,
+        input: [JSONValue],
+        tools: [ResponseToolDefinition]? = nil,
+        instructions: String? = nil,
+        previousResponseID: String? = nil,
+        promptCacheKey: String? = nil,
+        promptCacheRetention: String? = nil,
+        serviceTier: String? = nil
+    ) {
+        self.model = model
+        self.input = input
+        self.tools = tools
+        self.instructions = instructions
+        self.previousResponseID = previousResponseID
+        self.promptCacheKey = promptCacheKey
+        self.promptCacheRetention = promptCacheRetention
+        self.serviceTier = serviceTier
+    }
+}
+
+public struct ResponsesCompactionResult: Codable, Sendable, Equatable {
+    public var id: String?
+    public var object: String?
+    public var createdAt: Double?
+    public var output: [JSONValue]
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case object
+        case createdAt = "created_at"
+        case output
+    }
+
+    public init(id: String? = nil, object: String? = nil, createdAt: Double? = nil, output: [JSONValue]) {
+        self.id = id
+        self.object = object
+        self.createdAt = createdAt
+        self.output = output
+    }
+}
+
 public struct ResponsesRequest: Codable, Sendable, Equatable {
     public var model: String
     public var instructions: String?
@@ -219,6 +299,7 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
     public var toolChoice: JSONValue?
     public var text: ResponseTextOptions?
     public var multiAgent: MultiAgentConfiguration?
+    public var contextManagement: [ResponseContextManagement]?
 
     enum CodingKeys: String, CodingKey {
         case model
@@ -241,6 +322,7 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
         case toolChoice = "tool_choice"
         case text
         case multiAgent = "multi_agent"
+        case contextManagement = "context_management"
     }
 
     public init(
@@ -263,7 +345,8 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
         maxOutputTokens: Int? = nil,
         toolChoice: JSONValue? = nil,
         text: ResponseTextOptions? = nil,
-        multiAgent: MultiAgentConfiguration? = nil
+        multiAgent: MultiAgentConfiguration? = nil,
+        contextManagement: [ResponseContextManagement]? = nil
     ) {
         self.model = model
         self.instructions = instructions
@@ -285,6 +368,7 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
         self.toolChoice = toolChoice
         self.text = text
         self.multiAgent = multiAgent
+        self.contextManagement = contextManagement
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -311,6 +395,7 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
         try container.encodeIfPresent(toolChoice, forKey: .toolChoice)
         try container.encodeIfPresent(text, forKey: .text)
         try container.encodeIfPresent(multiAgent, forKey: .multiAgent)
+        try container.encodeIfPresent(contextManagement, forKey: .contextManagement)
     }
 }
 
@@ -383,6 +468,8 @@ public enum ModelStreamEvent: Sendable, Equatable {
     /// A replayable Responses output item such as encrypted reasoning, a
     /// hosted program, or a Multi-agent coordination item.
     case responseItemCompleted(JSONValue)
+    /// Provider signal that the dynamic `/models` catalog has changed.
+    case modelCatalogETag(String)
     case messageCompleted(String)
     case completed(responseID: String?, usage: TokenUsage?)
     case failed(String)
@@ -485,6 +572,11 @@ public enum ResponseInputBuilder {
         return .object(fields)
     }
 
+    /// Requests an immediate compaction pass when used as the final input item.
+    public static func compactionTrigger() -> JSONValue {
+        .object(["type": .string("compaction_trigger")])
+    }
+
     public static func injectedUserInstructions(title: String, body: String, metadata _: [String: JSONValue] = [:]) -> JSONValue {
         .object([
             "role": .string("user"),
@@ -504,7 +596,7 @@ public enum ResponseInputBuilder {
         case "web_search_call", "image_generation_call", "file_search_call", "computer_call",
              "code_interpreter_call", "shell_call", "apply_patch_call", "mcp_call", "tool_search_call",
              "program", "program_output", "reasoning", "multi_agent_call", "multi_agent_call_output",
-             "agent_message":
+             "agent_message", "compaction":
             return item
         default:
             return nil

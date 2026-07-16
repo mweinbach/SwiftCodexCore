@@ -159,6 +159,7 @@ final class CodexCoreTests: XCTestCase {
             safetyIdentifier: "stable-user-hash",
             maxOutputTokens: 64_000,
             multiAgent: MultiAgentConfiguration(maxConcurrentSubagents: 3),
+            contextManagement: [ResponseContextManagement(compactThreshold: 320_000)],
             responseIncludes: ["reasoning.encrypted_content"],
             toolChoice: .string("auto"),
             textOptions: ResponseTextOptions(verbosity: .low)
@@ -177,7 +178,43 @@ final class CodexCoreTests: XCTestCase {
         XCTAssertEqual(request.safetyIdentifier, "stable-user-hash")
         XCTAssertEqual(request.maxOutputTokens, 64_000)
         XCTAssertEqual(request.multiAgent?.maxConcurrentSubagents, 3)
+        XCTAssertEqual(request.contextManagement, [ResponseContextManagement(compactThreshold: 320_000)])
         XCTAssertEqual(request.text?.verbosity, .low)
+    }
+
+    func testAgentLoopPreservesMultimodalTurnsAndPrunesBeforeCompaction() async throws {
+        let compaction: JSONValue = .object([
+            "type": .string("compaction"),
+            "id": .string("cmp_1"),
+            "encrypted_content": .string("opaque")
+        ])
+        let provider = RecordingModelProvider(batches: [
+            [.responseItemCompleted(compaction), .completed(responseID: "r1", usage: nil)],
+            [.outputTextDelta("done"), .completed(responseID: "r2", usage: nil)]
+        ])
+        let config = AgentConfiguration(
+            contextManagement: [ResponseContextManagement(compactThreshold: 320_000)]
+        )
+        let runtime = CodexRuntime(configuration: config, modelProvider: provider, tools: [])
+        let thread = try await runtime.createThread()
+        let image = ResponseInputBuilder.inputImage(urlString: "data:image/png;base64,abc", detail: .original)
+
+        for try await _ in try await runtime.startTurn(
+            threadID: thread.id,
+            input: TurnInput(content: [ResponseInputBuilder.inputText("inspect"), image])
+        ).events {}
+        for try await _ in try await runtime.startTurn(threadID: thread.id, input: TurnInput("continue")).events {}
+
+        let firstInput = try XCTUnwrap(provider.requests.first?.input)
+        XCTAssertTrue(firstInput.contains { $0["content"]?.arrayValue?.last == image })
+        XCTAssertEqual(provider.requests.first?.contextManagement?.first?.compactThreshold, 320_000)
+
+        let secondInput = try XCTUnwrap(provider.requests.last?.input)
+        XCTAssertTrue(secondInput.contains(compaction))
+        XCTAssertEqual(secondInput.last?["content"]?.arrayValue?.first?["text"]?.stringValue, "continue")
+        XCTAssertFalse(secondInput.contains { item in
+            item["content"]?.arrayValue?.contains { $0["text"]?.stringValue == "inspect" } == true
+        })
     }
 
     func testNetworkServerToolsAreFilteredWhenSandboxDisallowsNetwork() async throws {
@@ -411,12 +448,7 @@ final class CodexCoreTests: XCTestCase {
         XCTAssertTrue(json.contains("\"allowed_callers\":[\"programmatic\"]"))
     }
 
-    func testGPT56CapabilitiesAndRequestControlsEncode() throws {
-        let capabilities = try XCTUnwrap(OpenAIModelCapabilities.gpt56Family[.gpt56Sol])
-        XCTAssertEqual(capabilities.contextWindow, 1_050_000)
-        XCTAssertEqual(capabilities.maxOutputTokens, 128_000)
-        XCTAssertEqual(capabilities.supportedReasoningEfforts, [.none, .low, .medium, .high, .xhigh, .max])
-
+    func testGPT56RequestControlsEncode() throws {
         let request = ResponsesRequest(
             model: OpenAIModel.gpt56Sol.rawValue,
             input: [ResponseInputBuilder.userMessage(content: [
@@ -432,7 +464,8 @@ final class CodexCoreTests: XCTestCase {
             safetyIdentifier: "stable-user-hash",
             maxOutputTokens: 128_000,
             text: ResponseTextOptions(verbosity: .high),
-            multiAgent: MultiAgentConfiguration(maxConcurrentSubagents: 4)
+            multiAgent: MultiAgentConfiguration(maxConcurrentSubagents: 4),
+            contextManagement: [ResponseContextManagement(compactThreshold: 900_000)]
         )
 
         let json = try JSONDecoder.codex.decode(JSONValue.self, from: JSONEncoder.codexCompact.encode(request))
@@ -443,6 +476,8 @@ final class CodexCoreTests: XCTestCase {
         XCTAssertEqual(json["prompt_cache_options"]?["mode"]?.stringValue, "explicit")
         XCTAssertEqual(json["prompt_cache_options"]?["ttl"]?.stringValue, "30m")
         XCTAssertEqual(json["multi_agent"]?["max_concurrent_subagents"]?.doubleValue, 4)
+        XCTAssertEqual(json["context_management"]?.arrayValue?.first?["type"]?.stringValue, "compaction")
+        XCTAssertEqual(json["context_management"]?.arrayValue?.first?["compact_threshold"]?.doubleValue, 900_000)
         XCTAssertEqual(json["input"]?.arrayValue?.first?["content"]?.arrayValue?.last?["detail"]?.stringValue, "original")
         XCTAssertEqual(
             json["input"]?.arrayValue?.first?["content"]?.arrayValue?.first?["prompt_cache_breakpoint"]?["mode"]?.stringValue,
@@ -487,6 +522,83 @@ final class CodexCoreTests: XCTestCase {
             multiAgent: MultiAgentConfiguration()
         )
         for try await _ in client.streamResponse(request) {}
+    }
+
+    func testDynamicModelsCatalogRefreshesFromCodexEndpointAndResponseETag() async throws {
+        let fetchCount = Locked(0)
+        StubURLProtocol.handler = { request in
+            switch (request.httpMethod, request.url?.path) {
+            case ("GET", "/backend-api/codex/models"):
+                XCTAssertEqual(
+                    URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "client_version" }?.value,
+                    "0.99.0"
+                )
+                fetchCount.withValue { $0 += 1 }
+                let etag = "catalog-\(fetchCount.value)"
+                return StubURLProtocol.response(
+                    for: request,
+                    headers: ["ETag": etag],
+                    json: #"{"models":[{"slug":"gpt-dynamic","display_name":"Dynamic","default_reasoning_level":"max","supported_reasoning_levels":[{"effort":"low"},{"effort":"max"}],"context_window":400000,"visibility":"list","priority":1,"supported_in_api":true,"supports_image_detail_original":true,"multi_agent_version":"v3","future_capability":{"enabled":true}}]}"#
+                )
+            case ("POST", "/backend-api/codex/responses"):
+                return StubURLProtocol.response(
+                    for: request,
+                    headers: ["X-Models-Etag": "catalog-2"],
+                    json: #"{"id":"resp_1","output_text":"ok"}"#
+                )
+            default:
+                XCTFail("Unexpected request: \(request.httpMethod ?? "") \(request.url?.absoluteString ?? "")")
+                return StubURLProtocol.response(for: request, statusCode: 404, json: #"{"error":"not found"}"#)
+            }
+        }
+        defer { StubURLProtocol.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let responsesEndpoint = URL(string: "https://chatgpt.test/backend-api/codex/responses")!
+        let manager = OpenAIModelsManager(
+            auth: StaticAuthProvider(),
+            options: OpenAIModelsManager.Options(
+                endpoint: responsesEndpoint.deletingLastPathComponent().appendingPathComponent("models"),
+                clientVersion: "0.99.0",
+                cacheURL: nil
+            ),
+            session: session
+        )
+
+        let initial = try await manager.refresh()
+        XCTAssertEqual(initial.source, .codex)
+        XCTAssertEqual(initial.etag, "catalog-1")
+        XCTAssertEqual(initial.models.map(\.slug), ["gpt-dynamic"])
+        XCTAssertEqual(initial.defaultModel?.defaultReasoningEffort, .max)
+        XCTAssertEqual(initial.defaultModel?.supportedReasoningEfforts, [.low, .max])
+        XCTAssertEqual(initial.defaultModel?.automaticCompactionTokenLimit, 360_000)
+        XCTAssertEqual(initial.defaultModel?["future_capability"]?["enabled"]?.boolValue, true)
+        var dynamicConfiguration = AgentConfiguration(reasoningEffort: nil, parallelToolCalls: nil)
+        dynamicConfiguration.applyModelDefaults(try XCTUnwrap(initial.defaultModel))
+        XCTAssertEqual(dynamicConfiguration.model, "gpt-dynamic")
+        XCTAssertEqual(dynamicConfiguration.reasoningEffort, .max)
+        XCTAssertEqual(dynamicConfiguration.contextManagement?.first?.compactThreshold, 360_000)
+
+        let client = OpenAIResponsesClient(
+            auth: StaticAuthProvider(),
+            options: OpenAIResponsesClient.Options(endpoint: responsesEndpoint),
+            session: session,
+            modelsManager: manager
+        )
+        var events: [ModelStreamEvent] = []
+        for try await event in client.streamResponse(ResponsesRequest(
+            model: "gpt-dynamic",
+            input: [ResponseInputBuilder.userMessage("hello")]
+        )) {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains(.modelCatalogETag("catalog-2")))
+        let refreshed = await manager.catalog(.offline)
+        XCTAssertEqual(refreshed.etag, "catalog-2")
+        XCTAssertEqual(fetchCount.value, 2)
     }
 
     func testResponsesRequestEncodesBackgroundAndStoreFlags() throws {
@@ -704,6 +816,42 @@ final class CodexCoreTests: XCTestCase {
         let captured = requests.value
         XCTAssertEqual(captured.map(\.method), ["POST", "GET", "POST"])
         XCTAssertTrue(captured.allSatisfy { $0.authorization == "Bearer test-token" })
+    }
+
+    func testOpenAIResponsesClientStandaloneCompaction() async throws {
+        let endpoint = URL(string: "https://example.test/v1/responses")!
+        let compaction: JSONValue = .object([
+            "type": .string("compaction"),
+            "encrypted_content": .string("opaque")
+        ])
+        StubURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path, "/v1/responses/compact")
+            let body = try JSONDecoder.codex.decode(JSONValue.self, from: request.bodyData())
+            XCTAssertEqual(body["model"]?.stringValue, "gpt-5.6-sol")
+            XCTAssertEqual(body["input"]?.arrayValue?.last?["type"]?.stringValue, "compaction_trigger")
+            return StubURLProtocol.response(
+                for: request,
+                json: #"{"id":"cmp_123","object":"response.compaction","created_at":1,"output":[{"type":"compaction","encrypted_content":"opaque"}]}"#
+            )
+        }
+        defer { StubURLProtocol.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let client = OpenAIResponsesClient(
+            auth: StaticAuthProvider(),
+            options: OpenAIResponsesClient.Options(endpoint: endpoint),
+            session: URLSession(configuration: configuration)
+        )
+        let result = try await client.compactResponse(ResponsesCompactionRequest(
+            model: OpenAIModel.gpt56Sol.rawValue,
+            input: [ResponseInputBuilder.userMessage("long context"), ResponseInputBuilder.compactionTrigger()]
+        ))
+
+        XCTAssertEqual(result.id, "cmp_123")
+        XCTAssertEqual(result.object, "response.compaction")
+        XCTAssertEqual(result.output, [compaction])
     }
 
     func testOpenAIResponsesClientExtractsSnapshotModelEvents() throws {
@@ -1152,16 +1300,29 @@ private final class StubURLProtocol: URLProtocol, @unchecked Sendable {
 
     override func stopLoading() {}
 
-    static func response(for request: URLRequest, statusCode: Int = 200, json: String) -> (HTTPURLResponse, Data) {
-        response(for: request, statusCode: statusCode, contentType: "application/json", body: json)
+    static func response(
+        for request: URLRequest,
+        statusCode: Int = 200,
+        headers: [String: String] = [:],
+        json: String
+    ) -> (HTTPURLResponse, Data) {
+        response(for: request, statusCode: statusCode, headers: headers, contentType: "application/json", body: json)
     }
 
-    static func response(for request: URLRequest, statusCode: Int = 200, contentType: String, body: String) -> (HTTPURLResponse, Data) {
+    static func response(
+        for request: URLRequest,
+        statusCode: Int = 200,
+        headers: [String: String] = [:],
+        contentType: String,
+        body: String
+    ) -> (HTTPURLResponse, Data) {
+        var headers = headers
+        headers["Content-Type"] = contentType
         let response = HTTPURLResponse(
             url: request.url!,
             statusCode: statusCode,
             httpVersion: nil,
-            headerFields: ["Content-Type": contentType]
+            headerFields: headers
         )!
         return (response, Data(body.utf8))
     }

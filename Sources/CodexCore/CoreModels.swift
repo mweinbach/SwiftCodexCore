@@ -127,10 +127,20 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
 
 public struct TurnInput: Codable, Sendable, Equatable {
     public var text: String
+    /// Responses API content blocks for multimodal turns. When omitted, `text`
+    /// is encoded as a single `input_text` block.
+    public var content: [JSONValue]?
     public var metadata: [String: JSONValue]
 
     public init(_ text: String, metadata: [String: JSONValue] = [:]) {
         self.text = text
+        self.content = nil
+        self.metadata = metadata
+    }
+
+    public init(content: [JSONValue], text: String? = nil, metadata: [String: JSONValue] = [:]) {
+        self.content = content
+        self.text = text ?? content.compactMap { $0["text"]?.stringValue }.joined(separator: "\n")
         self.metadata = metadata
     }
 }
@@ -155,7 +165,9 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
     public var promptCacheOptions: PromptCacheOptions?
     public var safetyIdentifier: String?
     public var maxOutputTokens: Int?
+    public var parallelToolCalls: Bool?
     public var multiAgent: MultiAgentConfiguration?
+    public var contextManagement: [ResponseContextManagement]?
     public var responseIncludes: [String]?
     public var toolChoice: JSONValue?
     public var textOptions: ResponseTextOptions?
@@ -165,7 +177,7 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
     public var serverTools: [ResponseToolDefinition]
 
     public init(
-        model: String = OpenAIModel.gpt56.rawValue,
+        model: String = OpenAIModel.gpt56Sol.rawValue,
         instructions: String = "",
         systemPromptMode: SystemPromptMode = .append,
         additionalSystemInstructions: [String] = [],
@@ -184,7 +196,9 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
         promptCacheOptions: PromptCacheOptions? = nil,
         safetyIdentifier: String? = nil,
         maxOutputTokens: Int? = nil,
+        parallelToolCalls: Bool? = true,
         multiAgent: MultiAgentConfiguration? = nil,
+        contextManagement: [ResponseContextManagement]? = nil,
         responseIncludes: [String]? = ["reasoning.encrypted_content"],
         toolChoice: JSONValue? = nil,
         textOptions: ResponseTextOptions? = nil,
@@ -212,7 +226,9 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
         self.promptCacheOptions = promptCacheOptions
         self.safetyIdentifier = safetyIdentifier
         self.maxOutputTokens = maxOutputTokens
+        self.parallelToolCalls = parallelToolCalls
         self.multiAgent = multiAgent
+        self.contextManagement = contextManagement
         self.responseIncludes = responseIncludes
         self.toolChoice = toolChoice
         self.textOptions = textOptions
