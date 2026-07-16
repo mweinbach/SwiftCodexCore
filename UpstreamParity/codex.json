@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "repository": "https://github.com/openai/codex.git",
+    "branch": "main",
+    "commit": "800715d201651a2a07c2706dca10400109dae3d3"
+  },
+  "sources": {
+    "model_catalog": {
+      "path": "codex-rs/models-manager/models.json",
+      "sha256": "adc01736a3d4fce69683c24848d62900a7ba07a30571803ab79565010aadba81"
+    },
+    "model_schema": {
+      "path": "codex-rs/protocol/src/openai_models.rs",
+      "sha256": "dea7eb2695b644fee838014e25490eeabd0b9d6c9e23d5e4c32a9114b02e027d"
+    },
+    "tool_mode_dispatch": {
+      "path": "codex-rs/core/src/tools/mod.rs",
+      "sha256": "70017fc7f721a4b8e9aef5996e72dc5f2f62f4f5500afc824447db557429ca20"
+    }
+  },
+  "contracts": {
+    "model_catalog": {
+      "source": "model_catalog",
+      "models": [
+        {
+          "slug": "gpt-5.6-sol",
+          "fields": {
+            "display_name": "GPT-5.6-Sol",
+            "context_window": 372000,
+            "max_context_window": 372000,
+            "tool_mode": "code_mode_only",
+            "apply_patch_tool_type": "freeform",
+            "shell_type": "shell_command",
+            "supports_parallel_tool_calls": true,
+            "supports_image_detail_original": true,
+            "supports_search_tool": true,
+            "use_responses_lite": true,
+            "input_modalities": [
+              "text",
+              "image"
+            ],
+            "visibility": "list",
+            "supported_in_api": true,
+            "default_reasoning_level": "low",
+            "multi_agent_version": "v2"
+          },
+          "reasoning_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "slug": "gpt-5.6-terra",
+          "fields": {
+            "display_name": "GPT-5.6-Terra",
+            "context_window": 372000,
+            "max_context_window": 372000,
+            "tool_mode": "code_mode_only",
+            "apply_patch_tool_type": "freeform",
+            "shell_type": "shell_command",
+            "supports_parallel_tool_calls": true,
+            "supports_image_detail_original": true,
+            "supports_search_tool": true,
+            "use_responses_lite": true,
+            "input_modalities": [
+              "text",
+              "image"
+            ],
+            "visibility": "list",
+            "supported_in_api": true,
+            "default_reasoning_level": "medium",
+            "multi_agent_version": "v2"
+          },
+          "reasoning_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ]
+        },
+        {
+          "slug": "gpt-5.6-luna",
+          "fields": {
+            "display_name": "GPT-5.6-Luna",
+            "context_window": 372000,
+            "max_context_window": 372000,
+            "tool_mode": "code_mode_only",
+            "apply_patch_tool_type": "freeform",
+            "shell_type": "shell_command",
+            "supports_parallel_tool_calls": true,
+            "supports_image_detail_original": true,
+            "supports_search_tool": true,
+            "use_responses_lite": true,
+            "input_modalities": [
+              "text",
+              "image"
+            ],
+            "visibility": "list",
+            "supported_in_api": true,
+            "default_reasoning_level": "medium",
+            "multi_agent_version": "v1"
+          },
+          "reasoning_efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ]
+    },
+    "tool_mode": {
+      "schema_source": "model_schema",
+      "dispatch_source": "tool_mode_dispatch",
+      "wire_values": [
+        "direct",
+        "code_mode",
+        "code_mode_only"
+      ],
+      "model_info_fields": [
+        "supports_parallel_tool_calls",
+        "supports_search_tool",
+        "use_responses_lite",
+        "tool_mode"
+      ],
+      "dispatch_snippets": [
+        "ToolMode::Direct",
+        "ToolMode::CodeMode",
+        "ToolMode::CodeModeOnly",
+        "Feature::CodeMode",
+        "Feature::CodeModeOnly"
+      ]
+    }
+  }
+}

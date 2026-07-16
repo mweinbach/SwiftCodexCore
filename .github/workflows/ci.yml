@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  upstream-parity:
+    name: Pinned upstream parity
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Validate pinned OpenAI Codex contracts
+        run: python3 Scripts/check_upstream_parity.py
+
+  test:
+    name: Swift tests
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Run test suite
+        run: swift test
+
+  release-build:
+    name: Release build
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Build package in release mode
+        run: swift build --configuration release
+
+  iphoneos-build:
+    name: CodexCore iPhoneOS build
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Build CodexCore for a generic iOS device
+        run: >-
+          xcodebuild
+          -scheme CodexCore
+          -configuration Release
+          -sdk iphoneos
+          -destination 'generic/platform=iOS'
+          -derivedDataPath "$RUNNER_TEMP/SwiftCodexCoreDerivedData"
+          CODE_SIGNING_ALLOWED=NO
+          build
