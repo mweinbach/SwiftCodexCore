@@ -154,6 +154,7 @@ public final class CodexAgent: Sendable {
     var finalUsage: TokenUsage?
     var status: TurnStatus = .completed
     var nextInputUsesPreviousResponse = false
+    let codeModeNotifications = PendingCodeModeNotifications()
     let promptCacheKey = try await effectivePromptCacheKey(threadID: threadID)
 
     for iteration in 0..<configuration.maxToolIterations {
@@ -187,6 +188,13 @@ public final class CodexAgent: Sendable {
         }
       }
 
+      let pendingNotificationOutputs = try await recordCodeModeNotifications(
+        codeModeNotifications.drain(),
+        threadID: threadID,
+        turnID: turnID
+      )
+      responseInputs.append(contentsOf: pendingNotificationOutputs)
+
       let registeredToolDefinitions = await toolRegistry.listDefinitions()
       let codeModeOptions = configuration.codeModeOptions ?? CodeModeOptions()
       let directLocalTools: [ResponseToolDefinition]
@@ -215,7 +223,8 @@ public final class CodexAgent: Sendable {
           ).map(\.responseTool)
           + CodeModeRuntime.responseTools(
             definitions: registeredToolDefinitions,
-            options: codeModeOptions
+            options: codeModeOptions,
+            codeModeOnly: true
           )
       }
       let serverTools: [ResponseToolDefinition]
@@ -255,7 +264,7 @@ public final class CodexAgent: Sendable {
           effortName: configuration.reasoningEffortName ?? configuration.reasoningEffort?.rawValue,
           summary: reasoningSummary,
           mode: configuration.reasoningMode,
-          context: configuration.reasoningContext
+          context: responsesLite ? .allTurns : configuration.reasoningContext
         ),
         store: false,
         previousResponseID: useResponseContinuation ? lastResponseID : nil,
@@ -410,7 +419,11 @@ public final class CodexAgent: Sendable {
               source: call.arguments,
               definitions: registeredToolDefinitions,
               context: context,
-              options: codeModeOptions
+              options: codeModeOptions,
+              notificationHandler: { notification in
+                codeModeNotifications.append(notification)
+                continuation.yield(.codeModeNotification(notification))
+              }
             )
           } else {
             do {
@@ -427,6 +440,11 @@ public final class CodexAgent: Sendable {
               result = ToolResult(content: String(describing: error), isError: true)
             }
           }
+          let notificationOutputs = try await recordCodeModeNotifications(
+            codeModeNotifications.drain(),
+            threadID: threadID,
+            turnID: turnID
+          )
           let resultItem = ThreadItem(
             threadID: threadID,
             turnID: turnID,
@@ -449,6 +467,7 @@ public final class CodexAgent: Sendable {
           try await threadManager.appendItem(resultItem, to: threadID)
           continuation.yield(.toolCompleted(call: call, result: result))
           continuation.yield(.itemCompleted(resultItem))
+          toolOutputs.append(contentsOf: notificationOutputs)
           if call.kind == .custom {
             toolOutputs.append(
               ResponseInputBuilder.customToolCallOutput(
@@ -468,6 +487,12 @@ public final class CodexAgent: Sendable {
         }
         continue
       }
+
+      _ = try await recordCodeModeNotifications(
+        codeModeNotifications.drain(),
+        threadID: threadID,
+        turnID: turnID
+      )
 
       let finalText = completedMessage ?? assistantBuffer
       if !finalText.isEmpty {
@@ -631,6 +656,45 @@ public final class CodexAgent: Sendable {
       content: input.content ?? [ResponseInputBuilder.inputText(input.text)])
   }
 
+  private func recordCodeModeNotifications(
+    _ notifications: [CodeModeNotification],
+    threadID: String,
+    turnID: String
+  ) async throws -> [JSONValue] {
+    var outputs: [JSONValue] = []
+    outputs.reserveCapacity(notifications.count)
+    for notification in notifications {
+      let item = ThreadItem(
+        threadID: threadID,
+        turnID: turnID,
+        kind: .toolResult,
+        summary: notification.text,
+        payload: .object([
+          "call_id": .string(notification.callID),
+          "name": .string(CodeModeRuntime.execToolName),
+          "content": .string(notification.text),
+          "wire_output": .string(notification.text),
+          "structured_content": .null,
+          "is_error": .bool(false),
+          "metadata": .object([
+            "code_mode_notification": .bool(true),
+            "cell_id": .string(notification.cellID),
+          ]),
+          "content_blocks": .null,
+          "caller": .null,
+          "tool_call_kind": .string(ToolCallKind.custom.rawValue),
+        ])
+      )
+      try await threadManager.appendItem(item, to: threadID)
+      outputs.append(
+        ResponseInputBuilder.customToolCallOutput(
+          callID: notification.callID,
+          output: .string(notification.text)
+        ))
+    }
+    return outputs
+  }
+
   private func userMessagePayload(_ input: TurnInput, steering: Bool = false) -> JSONValue {
     var fields: [String: JSONValue] = [
       "role": .string("user"),
@@ -671,6 +735,23 @@ public final class CodexAgent: Sendable {
 
   private func nonNull(_ value: JSONValue?) -> JSONValue? {
     value == .null ? nil : value
+  }
+}
+
+private final class PendingCodeModeNotifications: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage: [CodeModeNotification] = []
+
+  func append(_ notification: CodeModeNotification) {
+    lock.withLock { storage.append(notification) }
+  }
+
+  func drain() -> [CodeModeNotification] {
+    lock.withLock {
+      let notifications = storage
+      storage.removeAll(keepingCapacity: true)
+      return notifications
+    }
   }
 }
 

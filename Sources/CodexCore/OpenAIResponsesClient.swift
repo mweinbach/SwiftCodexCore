@@ -100,25 +100,79 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
   > {
     AsyncThrowingStream { continuation in
       let task = Task {
-        do {
-          let (bytes, http) = try await send(request, allowRefresh: true)
-          if let etag = http.value(forHTTPHeaderField: "X-Models-Etag") {
-            await modelsManager?.refreshIfNewETag(etag)
-            continuation.yield(.modelCatalogETag(etag))
-          }
-          let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? ""
-          if contentType.contains("text/event-stream") {
-            try await Self.parseSSE(bytes: bytes, continuation: continuation)
-          } else {
-            let data = try await collectBody(bytes)
-            try Self.parseJSONResponse(data: data, continuation: continuation)
-          }
-          continuation.finish()
-        } catch {
-          if Self.isCancellation(error) {
-            continuation.finish(throwing: CancellationError())
-          } else {
+        let state = RequestRetryState(identity: makeRequestIdentity(method: "POST"))
+        var yieldedETags = Set<String>()
+        while true {
+          let tracker = StreamEventTracker()
+          do {
+            let (bytes, http) = try await send(
+              request,
+              allowRefresh: true,
+              state: state
+            )
+            if let etag = http.value(forHTTPHeaderField: "X-Models-Etag"),
+              yieldedETags.insert(etag).inserted
+            {
+              await modelsManager?.refreshIfNewETag(etag)
+              continuation.yield(.modelCatalogETag(etag))
+            }
+            let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? ""
+            if contentType.contains("text/event-stream") {
+              try await Self.parseSSE(
+                bytes: bytes,
+                continuation: continuation,
+                tracker: tracker
+              )
+            } else {
+              let data = try await collectBody(bytes)
+              try Self.parseJSONResponse(
+                data: data,
+                continuation: continuation,
+                tracker: tracker
+              )
+            }
+            continuation.finish()
+            return
+          } catch {
+            if Self.isCancellation(error) {
+              continuation.finish(throwing: CancellationError())
+              return
+            }
+            if !tracker.didYieldSemanticEvent,
+              let delay = retryDelay(
+                forTransportError: error,
+                completedRetryCount: state.completedRetryCount
+              )
+            {
+              state.completedRetryCount += 1
+              emitRetry(
+                error,
+                delay: delay,
+                identity: state.identity,
+                method: "POST",
+                url: options.endpoint,
+                attempt: state.attempt
+              )
+              do {
+                try await sleeper(delay)
+                try Task.checkCancellation()
+              } catch {
+                continuation.finish(throwing: CancellationError())
+                return
+              }
+              continue
+            }
+            if Self.isRetryableTransportError(error) {
+              emitFailure(
+                error,
+                identity: state.identity,
+                method: "POST",
+                url: options.endpoint,
+                attempt: state.attempt
+              )
+            }
             continuation.finish(throwing: error)
+            return
           }
         }
       }
@@ -187,7 +241,8 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
       url: options.endpoint.appendingPathComponent("compact"),
       body: JSONEncoder.codexCompact.encode(request),
       accept: "application/json",
-      allowRefresh: true
+      allowRefresh: true,
+      useResponsesLite: request.useResponsesLite
     )
     return try JSONDecoder.codex.decode(ResponsesCompactionResult.self, from: data)
   }
@@ -204,19 +259,58 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     var idempotencyKey: String?
   }
 
-  private func send(_ request: ResponsesRequest, allowRefresh: Bool) async throws -> (
+  private final class RequestRetryState: @unchecked Sendable {
+    let identity: RequestIdentity
+    var completedRetryCount = 0
+    var attempt = 0
+
+    init(identity: RequestIdentity) {
+      self.identity = identity
+    }
+  }
+
+  private final class StreamEventTracker: @unchecked Sendable {
+    var didYieldSemanticEvent = false
+    var didReachTerminalEvent = false
+
+    func record(_ event: ModelStreamEvent) {
+      switch event {
+      case .completed:
+        didYieldSemanticEvent = true
+        didReachTerminalEvent = true
+      case .failed:
+        didYieldSemanticEvent = true
+        didReachTerminalEvent = true
+      case .raw, .modelCatalogETag:
+        break
+      default:
+        didYieldSemanticEvent = true
+      }
+    }
+  }
+
+  private struct InterruptedResponseStreamError: Error, CustomStringConvertible {
+    var description: String {
+      "Responses stream ended before response.completed"
+    }
+  }
+
+  private func send(
+    _ request: ResponsesRequest,
+    allowRefresh: Bool,
+    state: RequestRetryState
+  ) async throws -> (
     URLSession.AsyncBytes, HTTPURLResponse
   ) {
     let method = "POST"
     let url = options.endpoint
-    let identity = makeRequestIdentity(method: method)
+    let identity = state.identity
     var canRefresh = allowRefresh
-    var completedRetryCount = 0
-    var attempt = 0
 
     while true {
       try Task.checkCancellation()
-      attempt += 1
+      state.attempt += 1
+      let attempt = state.attempt
 
       let urlRequest: URLRequest
       do {
@@ -232,7 +326,6 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         result = try await session.bytes(for: urlRequest)
       } catch {
         try Self.throwIfCancellation(error)
-        emitFailure(error, identity: identity, method: method, url: url, attempt: attempt)
         throw error
       }
       try Task.checkCancellation()
@@ -290,7 +383,7 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
       try Task.checkCancellation()
       let retryDelay = retryDelay(
         for: http,
-        completedRetryCount: completedRetryCount
+        completedRetryCount: state.completedRetryCount
       )
       emitRateLimitIfNeeded(
         http,
@@ -302,7 +395,7 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
       )
 
       if let retryDelay {
-        completedRetryCount += 1
+        state.completedRetryCount += 1
         emitRetry(
           http,
           delay: retryDelay,
@@ -398,6 +491,23 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         result = try await session.data(for: request)
       } catch {
         try Self.throwIfCancellation(error)
+        if let delay = retryDelay(
+          forTransportError: error,
+          completedRetryCount: completedRetryCount
+        ) {
+          completedRetryCount += 1
+          emitRetry(
+            error,
+            delay: delay,
+            identity: identity,
+            method: method,
+            url: url,
+            attempt: attempt
+          )
+          try await sleeper(delay)
+          try Task.checkCancellation()
+          continue
+        }
         emitFailure(error, identity: identity, method: method, url: url, attempt: attempt)
         throw error
       }
@@ -543,6 +653,18 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     )
   }
 
+  private func retryDelay(
+    forTransportError error: Error,
+    completedRetryCount: Int
+  ) -> TimeInterval? {
+    guard Self.isRetryableTransportError(error),
+      completedRetryCount < max(0, transportPolicy.maximumRetryCount)
+    else {
+      return nil
+    }
+    return transportPolicy.delay(forRetry: completedRetryCount + 1, retryAfter: nil)
+  }
+
   private func emitRateLimitIfNeeded(
     _ response: HTTPURLResponse,
     retryDelay: TimeInterval?,
@@ -590,6 +712,29 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
       ))
   }
 
+  private func emitRetry(
+    _ error: Error,
+    delay: TimeInterval,
+    identity: RequestIdentity,
+    method: String,
+    url: URL,
+    attempt: Int
+  ) {
+    diagnostics(
+      ResponsesTransportDiagnostic(
+        kind: .retryScheduled,
+        requestID: identity.requestID,
+        idempotencyKey: identity.idempotencyKey,
+        method: method,
+        url: url,
+        attempt: attempt,
+        statusCode: nil,
+        serverRequestID: nil,
+        retryDelay: delay,
+        message: "Retrying Responses API request after transport failure: \(error)"
+      ))
+  }
+
   private func emitFailure(
     _ error: Error,
     http: HTTPURLResponse? = nil,
@@ -615,6 +760,21 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
 
   private static func isRetryableStatus(_ statusCode: Int) -> Bool {
     statusCode == 429 || (500..<600).contains(statusCode)
+  }
+
+  private static func isRetryableTransportError(_ error: Error) -> Bool {
+    if error is InterruptedResponseStreamError {
+      return true
+    }
+    guard let urlError = error as? URLError else { return false }
+    switch urlError.code {
+    case .timedOut, .cannotFindHost, .cannotConnectToHost, .networkConnectionLost,
+      .dnsLookupFailed, .notConnectedToInternet, .resourceUnavailable,
+      .secureConnectionFailed, .cannotLoadFromNetwork, .badServerResponse:
+      return true
+    default:
+      return false
+    }
   }
 
   private static func retryAfterDelay(from response: HTTPURLResponse) -> TimeInterval? {
@@ -701,7 +861,8 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
 
   private static func parseSSE(
     bytes: URLSession.AsyncBytes,
-    continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation
+    continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation,
+    tracker: StreamEventTracker
   ) async throws {
     var line = Data()
     var state = SSEParserState()
@@ -716,7 +877,12 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         guard let text = String(data: line, encoding: .utf8) else {
           throw CodexCoreError.invalidJSON("SSE response line was not UTF-8")
         }
-        try processSSELine(text, continuation: continuation, state: &state)
+        try processSSELine(
+          text,
+          continuation: continuation,
+          state: &state,
+          tracker: tracker
+        )
         line.removeAll(keepingCapacity: true)
       } else {
         line.append(byte)
@@ -728,27 +894,46 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
       guard let text = String(data: line, encoding: .utf8) else {
         throw CodexCoreError.invalidJSON("SSE response line was not UTF-8")
       }
-      try processSSELine(text, continuation: continuation, state: &state)
+      try processSSELine(
+        text,
+        continuation: continuation,
+        state: &state,
+        tracker: tracker
+      )
     }
-    try processSSELine("", continuation: continuation, state: &state)
+    try processSSELine("", continuation: continuation, state: &state, tracker: tracker)
+    guard tracker.didReachTerminalEvent else {
+      throw InterruptedResponseStreamError()
+    }
   }
 
   private static func parseSSE(
-    data: Data, continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation
+    data: Data,
+    continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation,
+    tracker: StreamEventTracker
   ) throws {
     guard let text = String(data: data, encoding: .utf8) else {
       throw CodexCoreError.invalidJSON("SSE response was not UTF-8")
     }
     var state = SSEParserState()
     for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
-      try processSSELine(String(rawLine), continuation: continuation, state: &state)
+      try processSSELine(
+        String(rawLine),
+        continuation: continuation,
+        state: &state,
+        tracker: tracker
+      )
     }
-    try processSSELine("", continuation: continuation, state: &state)
+    try processSSELine("", continuation: continuation, state: &state, tracker: tracker)
+    guard tracker.didReachTerminalEvent else {
+      throw InterruptedResponseStreamError()
+    }
   }
 
   private static func processSSELine(
     _ rawLine: String, continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation,
-    state: inout SSEParserState
+    state: inout SSEParserState,
+    tracker: StreamEventTracker
   ) throws {
     let line = rawLine.trimmingCharacters(in: .newlines)
     if line.isEmpty {
@@ -758,7 +943,12 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
       defer { state.eventName = nil }
       if payload == "[DONE]" { return }
       try emitEvent(
-        named: state.eventName, dataString: payload, continuation: continuation, state: &state)
+        named: state.eventName,
+        dataString: payload,
+        continuation: continuation,
+        state: &state,
+        tracker: tracker
+      )
     } else if line.hasPrefix(":") {
       return
     } else if line.hasPrefix("event:") {
@@ -769,15 +959,20 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
   }
 
   private static func parseJSONResponse(
-    data: Data, continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation
+    data: Data,
+    continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation,
+    tracker: StreamEventTracker
   ) throws {
     if looksLikeSSE(data) {
-      try parseSSE(data: data, continuation: continuation)
+      try parseSSE(data: data, continuation: continuation, tracker: tracker)
       return
     }
     let json = try JSONDecoder.codex.decode(JSONValue.self, from: data)
     let events = try eventsFromResponseObject(json)
-    for event in events { continuation.yield(event) }
+    for event in events {
+      tracker.record(event)
+      continuation.yield(event)
+    }
   }
 
   private static func looksLikeSSE(_ data: Data) -> Bool {
@@ -795,12 +990,14 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     named eventName: String?,
     dataString: String,
     continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation,
-    state: inout SSEParserState
+    state: inout SSEParserState,
+    tracker: StreamEventTracker
   ) throws {
     guard let data = dataString.data(using: .utf8) else { return }
     let json = try JSONDecoder.codex.decode(JSONValue.self, from: data)
     let type = json["type"]?.stringValue ?? eventName ?? ""
     for event in try eventsFromStreamObject(json, type: type, state: &state) {
+      tracker.record(event)
       continuation.yield(event)
     }
   }

@@ -42,7 +42,8 @@ public actor CodeModeRuntime {
     source: String,
     definitions: [ToolDefinition],
     context: ToolExecutionContext,
-    options: CodeModeOptions = CodeModeOptions()
+    options: CodeModeOptions = CodeModeOptions(),
+    notificationHandler: CodeModeNotificationHandler? = nil
   ) async -> ToolResult {
     let executionOptions: ExecutionOptions
     do {
@@ -52,17 +53,28 @@ public actor CodeModeRuntime {
     }
     enforceCellLimit(options.maxConcurrentCells)
     let cellID = UUID().uuidString.lowercased()
-    let session = engine.start(
-      request: CodeModeExecutionRequest(
-        source: executionOptions.source,
-        definitions: definitions,
-        registry: registry,
-        context: context,
-        initialStore: sessionStores[context.threadID] ?? [:],
-        options: options,
-        maxOutputTokens: executionOptions.maxOutputTokens,
-        tokenCounter: tokenCounter
-      ))
+    let callID = context.metadata["tool_call_id"]?.stringValue ?? cellID
+    var request = CodeModeExecutionRequest(
+      source: executionOptions.source,
+      definitions: definitions,
+      registry: registry,
+      context: context,
+      initialStore: sessionStores[context.threadID] ?? [:],
+      options: options,
+      maxOutputTokens: executionOptions.maxOutputTokens,
+      tokenCounter: tokenCounter
+    )
+    request.notificationHandler = { text in
+      notificationHandler?(
+        CodeModeNotification(
+          cellID: cellID,
+          threadID: context.threadID,
+          turnID: context.turnID,
+          callID: callID,
+          text: text
+        ))
+    }
+    let session = engine.start(request: request)
     let runningCell = RunningCell(
       threadID: context.threadID,
       session: session,
@@ -165,14 +177,23 @@ public actor CodeModeRuntime {
 
   public static func responseTools(
     definitions: [ToolDefinition],
-    options: CodeModeOptions = CodeModeOptions()
+    options: CodeModeOptions = CodeModeOptions(),
+    codeModeOnly: Bool = false
   ) -> [ResponseToolDefinition] {
-    [execResponseTool(definitions: definitions, options: options), waitResponseTool]
+    [
+      execResponseTool(
+        definitions: definitions,
+        options: options,
+        codeModeOnly: codeModeOnly
+      ),
+      waitResponseTool,
+    ]
   }
 
   public static func execResponseTool(
     definitions: [ToolDefinition],
-    options: CodeModeOptions = CodeModeOptions()
+    options: CodeModeOptions = CodeModeOptions(),
+    codeModeOnly: Bool = false
   ) -> ResponseToolDefinition {
     let bindings = CodeModeToolCatalog.bindings(definitions: definitions, options: options)
     let eager = bindings.filter { $0.definition.exposure != .deferred }
@@ -181,7 +202,12 @@ public actor CodeModeRuntime {
       eager
       .map { "- `tools.\($0.publicName)(...)`: \($0.definition.description)" }
       .joined(separator: "\n")
-    let suffix = available.isEmpty ? "" : "\n\nAvailable nested tools:\n\(available)"
+    let suffix: String
+    if codeModeOnly {
+      suffix = nestedToolReference(bindings: eager)
+    } else {
+      suffix = available.isEmpty ? "" : "\n\nAvailable nested tools:\n\(available)"
+    }
     let deferred =
       deferredCount == 0
       ? ""
@@ -193,7 +219,7 @@ public actor CodeModeRuntime {
 
         Call nested tools through `tools`, for example `await tools.some_tool({ key: "value" })`. Namespaced tools support both their normalized flat name and nested path. Tool failures reject the returned promise. `ALL_TOOLS` contains metadata for every enabled tool, including deferred tools.
 
-        Emit model-visible output with `text(value)`, `image(value, detail?)`, or `generatedImage(result)`. Remote image URLs are rejected; use a base64 `data:` URL or forward an MCP image content block. `notify(value)` emits and immediately yields. `store(key, value)` and `load(key)` persist JSON values for later cells in the same thread. `setTimeout`, `clearTimeout`, `exit`, and `yield_control()` are also available.
+        Emit model-visible output with `text(value)`, `image(value, detail?)`, or `generatedImage(result)`. Remote image URLs are rejected; use a base64 `data:` URL or forward an MCP image content block. `notify(value)` emits an independent custom-tool output immediately while the cell continues; it is not included in `exec` or `wait` output. `store(key, value)` and `load(key)` persist JSON values for later cells in the same thread. `setTimeout`, `clearTimeout`, `exit`, and `yield_control()` are also available.
 
         If the script is still running after the yield window, the result includes a cell ID. Continue it with `wait`, which returns only output not previously consumed. An optional strict first-line pragma can override the initial limits: `// @exec: {\"yield_time_ms\":10000,\"max_output_tokens\":1000}`.
         \(suffix)\(deferred)
@@ -235,6 +261,39 @@ public actor CodeModeRuntime {
     NEWLINE: /\\r?\\n/
     SOURCE: /[\\s\\S]+/
     """
+
+  private static func nestedToolReference(bindings: [CodeModeToolBinding]) -> String {
+    guard !bindings.isEmpty else { return "" }
+    let tools = bindings.map { binding in
+      let definition = binding.definition
+      let inputSchema = jsonString(definition.parameters) ?? "unknown"
+      let outputSchema =
+        definition.outputSchema.flatMap(jsonString)
+        ?? "unknown (no output schema advertised)"
+      let nestedName = binding.nestedPath.joined(separator: ".")
+      let alias =
+        nestedName == binding.publicName
+        ? ""
+        : "\nNested alias: `tools.\(nestedName)(args)`"
+      return """
+        ### `tools.\(binding.publicName)`
+        \(definition.description)
+
+        Callable: `const result = await tools.\(binding.publicName)(args)`\(alias)
+
+        Input JSON Schema:
+        ```json
+        \(inputSchema)
+        ```
+
+        Output JSON Schema:
+        ```json
+        \(outputSchema)
+        ```
+        """
+    }
+    return "\n\nNested tool reference:\n\n" + tools.joined(separator: "\n\n")
+  }
 
   private struct ExecutionOptions: Sendable {
     var source: String

@@ -5,32 +5,27 @@
   @testable import CodexCore
 
   final class CodeModeProcessEngineTests: XCTestCase {
-    func testProtocolStreamsIncrementalTypedOutputAndStoreCompletion() async throws {
+    func testProtocolRoutesNotifyOutsideIncrementalContent() async throws {
       let host = try makeFixtureHost(
         body: """
-          printf '%s\n' '{"block":{"notification":true,"text":"working","type":"text"},"type":"emit","yield":true}'
+          printf '%s\n' '{"text":"working","type":"notify"}'
           /bin/sleep 0.05
           printf '%s\n' '{"block":{"image_url":"data:image/png;base64,AAAA","type":"image"},"type":"emit","yield":false}'
           printf '%s\n' '{"completion":{"deletes":["old"],"error":null,"value":"done","writes":{"answer":42}},"type":"complete"}'
           """
       )
-      let session = makeEngine(host).start(request: request(initialStore: ["old": .bool(true)]))
+      let recorder = ProcessNotificationRecorder()
+      var executionRequest = request(initialStore: ["old": .bool(true)])
+      executionRequest.notificationHandler = recorder.append
+      let session = makeEngine(host).start(request: executionRequest)
 
-      let first = await session.wait(cursor: 0, yieldVersion: 0, timeoutMilliseconds: 1_000)
-      XCTAssertEqual(first.state, .yielded)
-      XCTAssertEqual(first.content.map(\.type), ["text"])
-      XCTAssertEqual(first.content.first?.textValue, "working")
-
-      let second = await session.wait(
-        cursor: first.nextCursor,
-        yieldVersion: first.yieldVersion,
-        timeoutMilliseconds: 1_000
-      )
-      XCTAssertEqual(second.state, .completed)
-      XCTAssertEqual(second.content.map(\.type), ["image"])
-      XCTAssertEqual(second.completion?.returnedValue, .string("done"))
-      XCTAssertEqual(second.completion?.storeWrites, ["answer": .number(42)])
-      XCTAssertEqual(second.completion?.storeDeletes, ["old"])
+      let snapshot = await session.wait(cursor: 0, yieldVersion: 0, timeoutMilliseconds: 1_000)
+      XCTAssertEqual(snapshot.state, .completed)
+      XCTAssertEqual(snapshot.content.map(\.type), ["image"])
+      XCTAssertEqual(snapshot.completion?.returnedValue, .string("done"))
+      XCTAssertEqual(snapshot.completion?.storeWrites, ["answer": .number(42)])
+      XCTAssertEqual(snapshot.completion?.storeDeletes, ["old"])
+      XCTAssertEqual(recorder.values, ["working"])
     }
 
     func testProtocolProxiesNestedToolCallsThroughParentRegistry() async throws {
@@ -179,30 +174,28 @@
       }
       let echo = ProcessFixtureEchoTool()
       let engine = makeEngine(URL(fileURLWithPath: path))
-      let session = engine.start(
-        request: request(
-          source: """
-            notify('working');
-            const result = await tools.fixture_echo({text: 'hello'});
-            text(result);
-            text(typeof globalThis.__swiftComplete);
-            store('answer', 42);
-            """,
-          tools: [echo],
-          definitions: [echo.definition]
-        ))
-
-      let first = await session.wait(cursor: 0, yieldVersion: 0, timeoutMilliseconds: 1_000)
-      XCTAssertEqual(first.state, .yielded)
-      XCTAssertEqual(first.content.first?.textValue, "working")
-      let second = await session.wait(
-        cursor: first.nextCursor,
-        yieldVersion: first.yieldVersion,
-        timeoutMilliseconds: 2_000
+      let recorder = ProcessNotificationRecorder()
+      var executionRequest = request(
+        source: """
+          notify('working');
+          const result = await tools.fixture_echo({text: 'hello'});
+          text(result);
+          text(typeof globalThis.__swiftComplete);
+          text(typeof globalThis.__swiftNotify);
+          store('answer', 42);
+          """,
+        tools: [echo],
+        definitions: [echo.definition]
       )
-      XCTAssertEqual(second.state, .completed)
-      XCTAssertEqual(second.content.compactMap(\.textValue), ["echo:hello", "undefined"])
-      XCTAssertEqual(second.completion?.storeWrites, ["answer": .number(42)])
+      executionRequest.notificationHandler = recorder.append
+      let session = engine.start(request: executionRequest)
+
+      let snapshot = await session.wait(cursor: 0, yieldVersion: 0, timeoutMilliseconds: 2_000)
+      XCTAssertEqual(snapshot.state, .completed)
+      XCTAssertEqual(
+        snapshot.content.compactMap(\.textValue), ["echo:hello", "undefined", "undefined"])
+      XCTAssertEqual(snapshot.completion?.storeWrites, ["answer": .number(42)])
+      XCTAssertEqual(recorder.values, ["working"])
     }
 
     func testRealJavaScriptHostRejectsCumulativeCellOutput() async throws {
@@ -332,6 +325,13 @@
     private var storage = 0
     var value: Int { lock.withLock { storage } }
     func increment() { lock.withLock { storage += 1 } }
+  }
+
+  private final class ProcessNotificationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+    var values: [String] { lock.withLock { storage } }
+    func append(_ value: String) { lock.withLock { storage.append(value) } }
   }
 
   private struct ProcessCountingTool: AgentTool {

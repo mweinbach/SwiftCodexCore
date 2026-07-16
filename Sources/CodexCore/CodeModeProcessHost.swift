@@ -151,6 +151,14 @@
               "type": .string("emit"), "block": block, "yield": .bool(shouldYield),
             ]))
         }
+        let notify: @convention(block) (String) -> Void = { [self] text in
+          guard !isClosed else { return }
+          guard text.utf8.count <= startMessage.maxContentBlockBytes else {
+            sendCompletion(error: "Code-mode notification exceeded the configured byte limit.")
+            return
+          }
+          send(.object(["type": .string("notify"), "text": .string(text)]))
+        }
         let yield: @convention(block) () -> Void = { [self] in
           guard !isClosed else { return }
           send(.object(["type": .string("yield")]))
@@ -167,6 +175,7 @@
         js.setObject(toolCall, forKeyedSubscript: "__swiftToolCall" as NSString)
         js.setObject(timer, forKeyedSubscript: "__swiftSetTimer" as NSString)
         js.setObject(emit, forKeyedSubscript: "__swiftEmit" as NSString)
+        js.setObject(notify, forKeyedSubscript: "__swiftNotify" as NSString)
         js.setObject(yield, forKeyedSubscript: "__swiftYield" as NSString)
         js.setObject(completed, forKeyedSubscript: "__swiftComplete" as NSString)
         let bridge = js.evaluateScript(

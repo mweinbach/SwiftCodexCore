@@ -246,21 +246,115 @@ public struct ResponseContextManagement: Codable, Sendable, Equatable {
   }
 }
 
+private enum ResponsesLiteWireShape {
+  static func input(
+    _ input: [JSONValue],
+    tools: [ResponseToolDefinition],
+    instructions: String?
+  ) -> [JSONValue] {
+    var shaped = input.map(normalizingImageInput)
+    let existingAdditionalTools = shaped.filter {
+      $0["type"]?.stringValue == "additional_tools"
+    }
+    shaped.removeAll { $0["type"]?.stringValue == "additional_tools" }
+
+    let supportedTools: [JSONValue]
+    if existingAdditionalTools.isEmpty {
+      supportedTools =
+        tools
+        .filter { $0.type == "function" || $0.type == "custom" }
+        .map { .object($0.fields) }
+    } else {
+      supportedTools =
+        existingAdditionalTools
+        .flatMap { $0["tools"]?.arrayValue ?? [] }
+        .filter {
+          let type = $0["type"]?.stringValue
+          return type == "function" || type == "custom"
+        }
+    }
+    var seenTools = Set<JSONValue>()
+    let uniqueTools = supportedTools.filter { seenTools.insert($0).inserted }
+    shaped.insert(
+      .object([
+        "type": .string("additional_tools"),
+        "role": .string("developer"),
+        "tools": .array(uniqueTools),
+      ]),
+      at: 0
+    )
+
+    if let instructions, !instructions.isEmpty,
+      !shaped.contains(where: { isDeveloperMessage($0, containing: instructions) })
+    {
+      let insertionIndex = shaped.first?["type"]?.stringValue == "additional_tools" ? 1 : 0
+      shaped.insert(ResponseInputBuilder.developerMessage(instructions), at: insertionIndex)
+    }
+
+    return shaped
+  }
+
+  static func reasoning(_ reasoning: ResponseReasoning?) -> ResponseReasoning {
+    var reasoning = reasoning ?? ResponseReasoning()
+    reasoning.context = ReasoningContext.allTurns.rawValue
+    return reasoning
+  }
+
+  private static func isDeveloperMessage(_ value: JSONValue, containing text: String) -> Bool {
+    guard value["role"]?.stringValue == "developer",
+      let content = value["content"]?.arrayValue
+    else {
+      return false
+    }
+    return content.contains { $0["text"]?.stringValue == text }
+  }
+
+  private static func normalizingImageInput(_ value: JSONValue) -> JSONValue {
+    switch value {
+    case .array(let values):
+      return .array(values.map(normalizingImageInput))
+    case .object(var fields):
+      if fields["type"]?.stringValue == "input_image" {
+        if let imageURL = fields["image_url"]?.stringValue,
+          imageURL.lowercased().hasPrefix("http://")
+            || imageURL.lowercased().hasPrefix("https://")
+        {
+          return .object([
+            "type": .string("input_text"),
+            "text": .string("image content omitted because remote image URLs are not supported"),
+          ])
+        }
+        fields.removeValue(forKey: "detail")
+      }
+      return .object(fields.mapValues(normalizingImageInput))
+    case .null, .bool, .number, .string:
+      return value
+    }
+  }
+}
+
 public struct ResponsesCompactionRequest: Codable, Sendable, Equatable {
   public var model: String
   public var input: [JSONValue]
   public var tools: [ResponseToolDefinition]?
   public var instructions: String?
+  public var reasoning: ResponseReasoning?
+  public var parallelToolCalls: Bool?
   public var previousResponseID: String?
   public var promptCacheKey: String?
   public var promptCacheRetention: String?
   public var serviceTier: String?
+  /// Internal request-shaping signal for the Responses Lite wire contract.
+  /// This is not serialized as a JSON field.
+  public var useResponsesLite: Bool = false
 
   enum CodingKeys: String, CodingKey {
     case model
     case input
     case tools
     case instructions
+    case reasoning
+    case parallelToolCalls = "parallel_tool_calls"
     case previousResponseID = "previous_response_id"
     case promptCacheKey = "prompt_cache_key"
     case promptCacheRetention = "prompt_cache_retention"
@@ -272,19 +366,48 @@ public struct ResponsesCompactionRequest: Codable, Sendable, Equatable {
     input: [JSONValue],
     tools: [ResponseToolDefinition]? = nil,
     instructions: String? = nil,
+    reasoning: ResponseReasoning? = nil,
+    parallelToolCalls: Bool? = nil,
     previousResponseID: String? = nil,
     promptCacheKey: String? = nil,
     promptCacheRetention: String? = nil,
-    serviceTier: String? = nil
+    serviceTier: String? = nil,
+    useResponsesLite: Bool = false
   ) {
     self.model = model
     self.input = input
     self.tools = tools
     self.instructions = instructions
+    self.reasoning = reasoning
+    self.parallelToolCalls = parallelToolCalls
     self.previousResponseID = previousResponseID
     self.promptCacheKey = promptCacheKey
     self.promptCacheRetention = promptCacheRetention
     self.serviceTier = serviceTier
+    self.useResponsesLite = useResponsesLite
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(model, forKey: .model)
+    if useResponsesLite {
+      try container.encode(
+        ResponsesLiteWireShape.input(input, tools: tools ?? [], instructions: instructions),
+        forKey: .input
+      )
+      try container.encode(ResponsesLiteWireShape.reasoning(reasoning), forKey: .reasoning)
+      try container.encode(false, forKey: .parallelToolCalls)
+    } else {
+      try container.encode(input, forKey: .input)
+      try container.encodeIfPresent(tools, forKey: .tools)
+      try container.encodeIfPresent(instructions, forKey: .instructions)
+      try container.encodeIfPresent(reasoning, forKey: .reasoning)
+      try container.encodeIfPresent(parallelToolCalls, forKey: .parallelToolCalls)
+    }
+    try container.encodeIfPresent(previousResponseID, forKey: .previousResponseID)
+    try container.encodeIfPresent(promptCacheKey, forKey: .promptCacheKey)
+    try container.encodeIfPresent(promptCacheRetention, forKey: .promptCacheRetention)
+    try container.encodeIfPresent(serviceTier, forKey: .serviceTier)
   }
 }
 
@@ -416,12 +539,20 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
     if !useResponsesLite {
       try container.encodeIfPresent(instructions, forKey: .instructions)
     }
-    try container.encode(input, forKey: .input)
+    let wireInput =
+      useResponsesLite
+      ? ResponsesLiteWireShape.input(input, tools: tools, instructions: instructions)
+      : input
+    try container.encode(wireInput, forKey: .input)
     if !useResponsesLite {
       try container.encode(tools, forKey: .tools)
     }
     try container.encode(stream, forKey: .stream)
-    try container.encodeIfPresent(reasoning, forKey: .reasoning)
+    if useResponsesLite {
+      try container.encode(ResponsesLiteWireShape.reasoning(reasoning), forKey: .reasoning)
+    } else {
+      try container.encodeIfPresent(reasoning, forKey: .reasoning)
+    }
     try container.encodeIfPresent(background, forKey: .background)
     try container.encodeIfPresent(store, forKey: .store)
     try container.encodeIfPresent(previousResponseID, forKey: .previousResponseID)

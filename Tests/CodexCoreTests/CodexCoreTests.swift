@@ -597,7 +597,21 @@ final class CodexCoreTests: XCTestCase {
       XCTAssertNil(body["tools"])
       XCTAssertNil(body["instructions"])
       XCTAssertEqual(body["parallel_tool_calls"]?.boolValue, false)
-      XCTAssertEqual(body["input"]?.arrayValue?.first?["type"]?.stringValue, "additional_tools")
+      XCTAssertEqual(body["reasoning"]?["context"]?.stringValue, "all_turns")
+      let input = try XCTUnwrap(body["input"]?.arrayValue)
+      XCTAssertEqual(input.first?["type"]?.stringValue, "additional_tools")
+      XCTAssertEqual(input.first?["tools"]?.arrayValue?.count, 1)
+      XCTAssertEqual(input.dropFirst().first?["role"]?.stringValue, "developer")
+      XCTAssertEqual(
+        input.dropFirst().first?["content"]?.arrayValue?.first?["text"]?.stringValue,
+        "must move to input for real Lite calls"
+      )
+      XCTAssertEqual(input.last?["role"]?.stringValue, "user")
+      let userContent = try XCTUnwrap(input.last?["content"]?.arrayValue)
+      XCTAssertNil(userContent[1]["detail"])
+      XCTAssertEqual(userContent[1]["image_url"]?.stringValue, "data:image/png;base64,AAAA")
+      XCTAssertEqual(userContent[2]["type"]?.stringValue, "input_text")
+      XCTAssertNil(userContent[2]["image_url"])
       return StubURLProtocol.response(for: request, json: #"{"output_text":"ok"}"#)
     }
     defer { StubURLProtocol.handler = nil }
@@ -612,11 +626,45 @@ final class CodexCoreTests: XCTestCase {
     let request = ResponsesRequest(
       model: OpenAIModel.gpt56Sol.rawValue,
       instructions: "must move to input for real Lite calls",
-      input: [ResponseInputBuilder.additionalTools([tool])],
-      tools: [tool],
+      input: [
+        ResponseInputBuilder.userMessage(content: [
+          ResponseInputBuilder.inputText("hello"),
+          ResponseInputBuilder.inputImage(
+            urlString: "data:image/png;base64,AAAA",
+            detail: .original
+          ),
+          ResponseInputBuilder.inputImage(
+            urlString: "https://example.com/private.png",
+            detail: .high
+          ),
+        ])
+      ],
+      tools: [tool, .webSearch()],
       useResponsesLite: true
     )
     for try await _ in client.streamResponse(request) {}
+
+    let preShaped = ResponsesRequest(
+      model: OpenAIModel.gpt56Sol.rawValue,
+      input: [
+        ResponseInputBuilder.developerMessage("already moved"),
+        ResponseInputBuilder.additionalTools([tool, .webSearch(), tool]),
+        ResponseInputBuilder.userMessage("hello"),
+        ResponseInputBuilder.additionalTools([tool]),
+      ],
+      tools: [tool],
+      useResponsesLite: true
+    )
+    let encoded = try JSONDecoder.codex.decode(
+      JSONValue.self,
+      from: JSONEncoder.codexCompact.encode(preShaped)
+    )
+    XCTAssertEqual(
+      encoded["input"]?.arrayValue?.filter { $0["type"]?.stringValue == "additional_tools" }.count,
+      1
+    )
+    XCTAssertEqual(encoded["input"]?.arrayValue?.first?["type"]?.stringValue, "additional_tools")
+    XCTAssertEqual(encoded["input"]?.arrayValue?.first?["tools"]?.arrayValue?.count, 1)
   }
 
   func testDynamicModelsCatalogRefreshesFromCodexEndpointAndResponseETag() async throws {
@@ -941,8 +989,19 @@ final class CodexCoreTests: XCTestCase {
     StubURLProtocol.handler = { request in
       XCTAssertEqual(request.httpMethod, "POST")
       XCTAssertEqual(request.url?.path, "/v1/responses/compact")
+      XCTAssertEqual(
+        request.value(forHTTPHeaderField: "x-openai-internal-codex-responses-lite"),
+        "true"
+      )
       let body = try JSONDecoder.codex.decode(JSONValue.self, from: request.bodyData())
       XCTAssertEqual(body["model"]?.stringValue, "gpt-5.6-sol")
+      XCTAssertNil(body["tools"])
+      XCTAssertNil(body["instructions"])
+      XCTAssertEqual(body["reasoning"]?["context"]?.stringValue, "all_turns")
+      XCTAssertEqual(body["parallel_tool_calls"]?.boolValue, false)
+      XCTAssertEqual(body["input"]?.arrayValue?.first?["type"]?.stringValue, "additional_tools")
+      XCTAssertEqual(
+        body["input"]?.arrayValue?.dropFirst().first?["role"]?.stringValue, "developer")
       XCTAssertEqual(body["input"]?.arrayValue?.last?["type"]?.stringValue, "compaction_trigger")
       return StubURLProtocol.response(
         for: request,
@@ -965,7 +1024,12 @@ final class CodexCoreTests: XCTestCase {
         input: [
           ResponseInputBuilder.userMessage("long context"),
           ResponseInputBuilder.compactionTrigger(),
-        ]
+        ],
+        tools: [EchoTool().definition.responseTool],
+        instructions: "compact carefully",
+        reasoning: ResponseReasoning(context: "current_turn"),
+        parallelToolCalls: true,
+        useResponsesLite: true
       ))
 
     XCTAssertEqual(result.id, "cmp_123")
@@ -1399,6 +1463,7 @@ final class CodexCoreTests: XCTestCase {
     let agent = CodexAgent(
       configuration: AgentConfiguration(
         reasoningEffortName: "future_effort",
+        reasoningContext: .currentTurn,
         useResponsesLite: true,
         serverTools: [.webSearch()]
       ),
@@ -1422,6 +1487,7 @@ final class CodexCoreTests: XCTestCase {
 
     let request = try XCTUnwrap(provider.requests.first)
     XCTAssertEqual(request.reasoning?.effort, "future_effort")
+    XCTAssertEqual(request.reasoning?.context, "all_turns")
     XCTAssertTrue(request.useResponsesLite)
     XCTAssertNil(request.instructions)
     XCTAssertEqual(request.parallelToolCalls, false)

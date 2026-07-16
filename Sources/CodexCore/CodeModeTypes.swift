@@ -36,6 +36,27 @@ public struct CodeModeDiagnostic: Sendable, Equatable {
 
 public typealias CodeModeDiagnosticsHandler = @Sendable (CodeModeDiagnostic) -> Void
 
+/// A progress message emitted by `notify()` while a code-mode cell continues
+/// running. Notifications are independent custom-tool outputs; they are never
+/// included in the cell's incremental `text()`/`image()` output.
+public struct CodeModeNotification: Sendable, Equatable {
+  public var cellID: String
+  public var threadID: String
+  public var turnID: String
+  public var callID: String
+  public var text: String
+
+  public init(cellID: String, threadID: String, turnID: String, callID: String, text: String) {
+    self.cellID = cellID
+    self.threadID = threadID
+    self.turnID = turnID
+    self.callID = callID
+    self.text = text
+  }
+}
+
+public typealias CodeModeNotificationHandler = @Sendable (CodeModeNotification) -> Void
+
 /// Token accounting used for code-mode output limits. Hosts can inject their
 /// model tokenizer; the bundled implementation is a dependency-free UTF-8
 /// estimate suitable for conservative defaults.
@@ -168,6 +189,7 @@ public struct CodeModeExecutionRequest: Sendable {
   public var options: CodeModeOptions
   public var maxOutputTokens: Int
   public var tokenCounter: any CodeModeTokenCounting
+  var notificationHandler: @Sendable (String) -> Void
 
   public init(
     source: String,
@@ -187,6 +209,7 @@ public struct CodeModeExecutionRequest: Sendable {
     self.options = options
     self.maxOutputTokens = maxOutputTokens
     self.tokenCounter = tokenCounter
+    self.notificationHandler = { _ in }
   }
 }
 

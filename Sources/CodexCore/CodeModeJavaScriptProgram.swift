@@ -29,6 +29,7 @@ enum CodeModeJavaScriptProgram {
           toolCall: globalThis.__swiftToolCall,
           setTimer: globalThis.__swiftSetTimer,
           emit: globalThis.__swiftEmit,
+          notify: globalThis.__swiftNotify,
           yield: globalThis.__swiftYield,
           complete: globalThis.__swiftComplete
         });
@@ -46,7 +47,7 @@ enum CodeModeJavaScriptProgram {
         const __Boolean = Boolean;
         const __Error = Error;
         const __TypeError = TypeError;
-        for (const name of ['__swiftToolCall', '__swiftSetTimer', '__swiftEmit', '__swiftYield', '__swiftComplete']) {
+        for (const name of ['__swiftToolCall', '__swiftSetTimer', '__swiftEmit', '__swiftNotify', '__swiftYield', '__swiftComplete']) {
           try { Reflect.deleteProperty(globalThis, name); } catch (_) {}
           if (Object.prototype.hasOwnProperty.call(globalThis, name)) {
             try { Object.defineProperty(globalThis, name, {value: undefined, writable: false, configurable: false}); }
@@ -153,8 +154,8 @@ enum CodeModeJavaScriptProgram {
         }
         function notify(value) {
           const rendered = __serializeText(value);
-          __emit({type: 'text', text: rendered, notification: true}, true);
-          return value;
+          if (rendered.trim().length === 0) throw new __TypeError('notify expects non-empty text');
+          if (!__closed) __host.notify(rendered);
         }
         function store(key, value) {
           if (__closed) throw new __Error('Code-mode cell is already closed.');

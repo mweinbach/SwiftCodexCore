@@ -29,22 +29,75 @@ final class CodeModeParityTests: XCTestCase {
     XCTAssertEqual(second.metadata["running"]?.boolValue, false)
   }
 
-  func testNotifyYieldsImmediatelyAndExecutionResumes() async throws {
-    let runtime = CodeModeRuntime(registry: ToolRegistry())
-    let first = await runtime.execute(
+  func testNotifyUsesIndependentCallbackWithoutYieldingOrEnteringCellOutput() async throws {
+    let runtime = CodeModeRuntime(
+      registry: ToolRegistry(),
+      engine: JavaScriptCoreCodeModeEngine()
+    )
+    let recorder = NotificationRecorder()
+    var executionContext = context()
+    executionContext.metadata["tool_call_id"] = .string("exec-call")
+    let result = await runtime.execute(
       source:
         "notify('working'); await new Promise(resolve => setTimeout(resolve, 50)); text('done');",
       definitions: [],
-      context: context()
+      context: executionContext,
+      notificationHandler: recorder.append
     )
-    XCTAssertTrue(first.content.contains("working"))
-    let cellID = try XCTUnwrap(first.metadata["cell_id"]?.stringValue)
-    let second = await runtime.wait(
-      arguments: .object([
-        "cell_id": .string(cellID), "yield_time_ms": .number(1_000),
-      ]))
-    XCTAssertTrue(second.content.contains("done"))
-    XCTAssertFalse(second.content.contains("working"))
+    XCTAssertEqual(result.content, "done")
+    XCTAssertEqual(result.metadata["state"]?.stringValue, "completed")
+    XCTAssertFalse(result.content.contains("working"))
+    let notification = try XCTUnwrap(recorder.notifications.first)
+    XCTAssertEqual(notification.text, "working")
+    XCTAssertEqual(notification.callID, "exec-call")
+    XCTAssertEqual(notification.threadID, executionContext.threadID)
+    XCTAssertEqual(notification.turnID, executionContext.turnID)
+    XCTAssertEqual(notification.cellID, result.metadata["cell_id"]?.stringValue)
+  }
+
+  func testAgentPublishesNotifyEventAndDistinctCustomToolOutput() async throws {
+    let provider = CodeModeRecordingProvider(batches: [
+      [
+        .toolCallCompleted(
+          ToolCall(
+            callID: "exec-notify",
+            name: CodeModeRuntime.execToolName,
+            arguments: "notify('working'); text('done');",
+            kind: .custom
+          )),
+        .completed(responseID: "response-1", usage: nil),
+      ],
+      [.outputTextDelta("finished"), .completed(responseID: "response-2", usage: nil)],
+    ])
+    let registry = ToolRegistry()
+    let agent = CodexAgent(
+      configuration: AgentConfiguration(toolMode: .codeModeOnly),
+      modelProvider: provider,
+      toolRegistry: registry,
+      threadManager: ThreadManager(store: InMemoryThreadStore()),
+      codeModeRuntime: CodeModeRuntime(
+        registry: registry,
+        engine: JavaScriptCoreCodeModeEngine()
+      )
+    )
+    let thread = try await agent.createThread()
+    var notifications: [CodeModeNotification] = []
+    for try await event in agent.startTurn(
+      threadID: thread.id,
+      input: TurnInput("send progress")
+    ).events {
+      if case .codeModeNotification(let notification) = event {
+        notifications.append(notification)
+      }
+    }
+
+    XCTAssertEqual(notifications.map(\.text), ["working"])
+    XCTAssertEqual(notifications.first?.callID, "exec-notify")
+    let outputs = try XCTUnwrap(provider.requests.dropFirst().first).input.filter {
+      $0["type"]?.stringValue == "custom_tool_call_output"
+        && $0["call_id"]?.stringValue == "exec-notify"
+    }
+    XCTAssertEqual(outputs.compactMap { $0["output"]?.stringValue }, ["working", "done"])
   }
 
   func testConcurrentCellsMergeOnlyKeysTheyWrite() async throws {
@@ -108,7 +161,8 @@ final class CodeModeParityTests: XCTestCase {
     let result = await runtime.execute(
       source: """
         const privileged = [
-          '__swiftToolCall', '__swiftSetTimer', '__swiftEmit', '__swiftYield', '__swiftComplete'
+          '__swiftToolCall', '__swiftSetTimer', '__swiftEmit', '__swiftNotify',
+          '__swiftYield', '__swiftComplete'
         ].map(name => typeof globalThis[name]);
         const internals = [
           typeof __host, typeof __bridge, typeof __complete, typeof __writes,
@@ -129,7 +183,7 @@ final class CodeModeParityTests: XCTestCase {
     XCTAssertFalse(result.isError)
     XCTAssertEqual(
       result.content,
-      #"{"privileged":["undefined","undefined","undefined","undefined","undefined"],"internals":["undefined","undefined","undefined","undefined","undefined","undefined","undefined"]}"#
+      #"{"privileged":["undefined","undefined","undefined","undefined","undefined","undefined"],"internals":["undefined","undefined","undefined","undefined","undefined","undefined","undefined"]}"#
     )
     XCTAssertEqual(counter.value, 0)
 
@@ -432,6 +486,46 @@ final class CodeModeParityTests: XCTestCase {
     XCTAssertTrue(excluded.isEmpty)
   }
 
+  func testCodeModeOnlyExecDescriptionIncludesEveryEagerToolSchema() throws {
+    let eager = ToolDefinition(
+      name: "schema_tool",
+      description: "Uses a typed input and output.",
+      parameters: ToolSchemas.object(
+        properties: ["query": ToolSchemas.string(description: "Search query")],
+        required: ["query"]
+      ),
+      outputSchema: ToolSchemas.object(
+        properties: ["matches": .object(["type": .string("number")])],
+        required: ["matches"]
+      )
+    )
+    let deferred = ToolDefinition(
+      name: "deferred_tool",
+      description: "Loaded later.",
+      parameters: ToolSchemas.object(properties: ["hidden": ToolSchemas.string()]),
+      exposure: .deferred
+    )
+    let description = try XCTUnwrap(
+      CodeModeRuntime.execResponseTool(
+        definitions: [eager, deferred],
+        codeModeOnly: true
+      ).description
+    )
+
+    XCTAssertTrue(description.contains("### `tools.schema_tool`"))
+    XCTAssertTrue(description.contains("await tools.schema_tool(args)"))
+    XCTAssertTrue(description.contains("Input JSON Schema:"))
+    XCTAssertTrue(description.contains("Output JSON Schema:"))
+    XCTAssertTrue(description.contains("\"query\""))
+    XCTAssertTrue(description.contains("\"matches\""))
+    XCTAssertFalse(description.contains("### `tools.deferred_tool`"))
+
+    let ordinaryDescription = try XCTUnwrap(
+      CodeModeRuntime.execResponseTool(definitions: [eager]).description
+    )
+    XCTAssertFalse(ordinaryDescription.contains("Input JSON Schema:"))
+  }
+
   func testHiddenAndDirectOnlyToolsAreNotNested() {
     let hidden = NamedTool(name: "hidden", exposure: .hidden)
     let hiddenInDirectNamespace = NamedTool(
@@ -489,6 +583,40 @@ private final class Counter: @unchecked Sendable {
   private var storage = 0
   var value: Int { lock.withLock { storage } }
   func increment() { lock.withLock { storage += 1 } }
+}
+
+private final class NotificationRecorder: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage: [CodeModeNotification] = []
+  var notifications: [CodeModeNotification] { lock.withLock { storage } }
+  func append(_ notification: CodeModeNotification) {
+    lock.withLock { storage.append(notification) }
+  }
+}
+
+private final class CodeModeRecordingProvider: ModelProvider, @unchecked Sendable {
+  private let lock = NSLock()
+  private var batches: [[ModelStreamEvent]]
+  private var requestStorage: [ResponsesRequest] = []
+
+  init(batches: [[ModelStreamEvent]]) {
+    self.batches = batches
+  }
+
+  var requests: [ResponsesRequest] { lock.withLock { requestStorage } }
+
+  func streamResponse(_ request: ResponsesRequest) -> AsyncThrowingStream<ModelStreamEvent, Error> {
+    let events = lock.withLock {
+      requestStorage.append(request)
+      return batches.isEmpty
+        ? [.completed(responseID: nil, usage: nil)]
+        : batches.removeFirst()
+    }
+    return AsyncThrowingStream { continuation in
+      for event in events { continuation.yield(event) }
+      continuation.finish()
+    }
+  }
 }
 
 private struct CountingTool: AgentTool {

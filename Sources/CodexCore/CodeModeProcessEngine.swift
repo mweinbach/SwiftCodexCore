@@ -287,6 +287,12 @@
           return
         }
         emit(ToolContentBlock(fields: fields), shouldYield: event["yield"]?.boolValue ?? false)
+      case "notify":
+        guard let text = event["text"]?.stringValue else {
+          failProtocol("Code-mode host emitted an invalid notification.")
+          return
+        }
+        request.notificationHandler(text)
       case "yield":
         signalYield()
       case "complete":

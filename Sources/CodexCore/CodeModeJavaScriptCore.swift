@@ -105,6 +105,9 @@ final class JavaScriptCoreCodeModeCell: CodeModeCellSession, @unchecked Sendable
       let emit: @convention(block) (String, Bool) -> Void = { [self] payload, shouldYield in
         emit(payload: payload, shouldYield: shouldYield)
       }
+      let notify: @convention(block) (String) -> Void = { [self] text in
+        notify(text: text)
+      }
       let yield: @convention(block) () -> Void = { [self] in signalYield() }
       let completed: @convention(block) (String) -> Void = { [self] payload in
         complete(payload: payload)
@@ -112,6 +115,7 @@ final class JavaScriptCoreCodeModeCell: CodeModeCellSession, @unchecked Sendable
       js.setObject(toolCall, forKeyedSubscript: "__swiftToolCall" as NSString)
       js.setObject(timer, forKeyedSubscript: "__swiftSetTimer" as NSString)
       js.setObject(emit, forKeyedSubscript: "__swiftEmit" as NSString)
+      js.setObject(notify, forKeyedSubscript: "__swiftNotify" as NSString)
       js.setObject(yield, forKeyedSubscript: "__swiftYield" as NSString)
       js.setObject(completed, forKeyedSubscript: "__swiftComplete" as NSString)
 
@@ -218,6 +222,19 @@ final class JavaScriptCoreCodeModeCell: CodeModeCellSession, @unchecked Sendable
     let pending = shouldYield ? drainReadyWaitersLocked() : []
     lock.unlock()
     resume(pending)
+  }
+
+  private func notify(text: String) {
+    guard !isClosed else { return }
+    guard
+      text.utf8.count
+        <= CodeModeOutputByteLimits.contentBlockBytes(request.options.maxContentBlockBytes)
+    else {
+      finish(
+        CodeModeCompletion(error: "Code-mode notification exceeded the configured byte limit."))
+      return
+    }
+    request.notificationHandler(text)
   }
 
   private func signalYield() {
