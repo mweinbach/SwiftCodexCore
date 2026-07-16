@@ -17,7 +17,8 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "CodexCore"
+            name: "CodexCore",
+            linkerSettings: [.linkedFramework("JavaScriptCore")]
         ),
         .target(
             name: "CodexCoreJustBash",

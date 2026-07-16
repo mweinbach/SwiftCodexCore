@@ -78,6 +78,14 @@ public struct ResponseToolDefinition: Codable, Sendable, Equatable {
         ResponseToolDefinition(type: type, options: options)
     }
 
+    public static func custom(name: String, description: String, format: JSONValue) -> ResponseToolDefinition {
+        ResponseToolDefinition(type: "custom", options: [
+            "name": .string(name),
+            "description": .string(description),
+            "format": format
+        ])
+    }
+
     public static func webSearch(
         searchContextSize: String? = nil,
         userLocation: JSONValue? = nil,
@@ -551,6 +559,17 @@ public enum ResponseInputBuilder {
     }
 
     public static func functionCall(_ call: ToolCall) -> JSONValue {
+        if call.kind == .custom {
+            var fields: [String: JSONValue] = [
+                "type": .string("custom_tool_call"),
+                "id": .string(call.id),
+                "call_id": .string(call.callID),
+                "name": .string(call.name),
+                "input": .string(call.arguments)
+            ]
+            if let caller = call.caller { fields["caller"] = caller }
+            return .object(fields)
+        }
         var fields: [String: JSONValue] = [
             "type": .string("function_call"),
             "id": .string(call.id),
@@ -570,6 +589,14 @@ public enum ResponseInputBuilder {
         ]
         if let caller { fields["caller"] = caller }
         return .object(fields)
+    }
+
+    public static func customToolCallOutput(callID: String, output: String) -> JSONValue {
+        .object([
+            "type": .string("custom_tool_call_output"),
+            "call_id": .string(callID),
+            "output": .string(output)
+        ])
     }
 
     /// Requests an immediate compaction pass when used as the final input item.

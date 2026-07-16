@@ -343,7 +343,7 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
             return [.outputTextDelta(json["delta"]?.stringValue ?? "")]
         case "response.reasoning_summary_text.delta", "response.reasoning.delta", "response.output_text.annotation.added":
             return [.reasoningDelta(json["delta"]?.stringValue ?? "")]
-        case "response.function_call_arguments.delta":
+        case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
             let callID = json["call_id"]?.stringValue ?? json["item_id"]?.stringValue ?? "unknown"
             return [.toolCallDelta(callID: callID, name: nil, argumentsDelta: json["delta"]?.stringValue ?? "")]
         case "response.output_item.done":
@@ -423,12 +423,14 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     }
 
     private static func toolCall(fromOutputItem item: JSONValue) throws -> ToolCall? {
-        guard item["type"]?.stringValue == "function_call" else { return nil }
+        let type = item["type"]?.stringValue
+        guard type == "function_call" || type == "custom_tool_call" else { return nil }
         let callID = item["call_id"]?.stringValue ?? item["id"]?.stringValue ?? UUID().uuidString
         let name = item["name"]?.stringValue ?? "unknown"
-        let arguments = item["arguments"]?.stringValue ?? "{}"
+        let isCustom = type == "custom_tool_call"
+        let arguments = isCustom ? (item["input"]?.stringValue ?? "") : (item["arguments"]?.stringValue ?? "{}")
         let rawArguments: JSONValue?
-        if let data = arguments.data(using: .utf8), let decoded = try? JSONDecoder.codex.decode(JSONValue.self, from: data) {
+        if !isCustom, let data = arguments.data(using: .utf8), let decoded = try? JSONDecoder.codex.decode(JSONValue.self, from: data) {
             rawArguments = decoded
         } else {
             rawArguments = nil
@@ -439,7 +441,8 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
             name: name,
             arguments: arguments,
             rawArguments: rawArguments,
-            caller: item["caller"]
+            caller: item["caller"],
+            kind: isCustom ? .custom : .function
         )
     }
 

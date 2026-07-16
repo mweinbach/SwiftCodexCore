@@ -15,6 +15,7 @@ A SwiftPM package that implements a Codex-style agent core in Swift:
 - AGENTS.md project-instruction injection and SKILL.md progressive skill injection
 - dynamic Codex-style `/models` discovery with ETag refresh and an offline cache
 - GPT-5.6 reasoning, caching, multimodal, compaction, Multi-agent, and programmatic-tool controls
+- Codex-compatible `code_mode_only` execution with sandboxed JavaScript `exec`, `wait`, `tools.*`, and `ALL_TOOLS`
 - built-in Responses server-tool definitions for web/file search, image generation, hosted shell, code interpreter, apply patch, skills, computer use, tool search, and remote MCP
 - high-level `CodexRuntime` facade for app/server integrations
 
@@ -62,6 +63,24 @@ let model = OpenAIResponsesClient(
 ```
 
 Detailed Codex catalogs are authoritative. The standard OpenAI `/v1/models` shape is also accepted; its IDs are merged with fallback metadata because that endpoint does not currently return the full Codex capability record.
+
+When a detailed model record advertises `tool_mode: "code_mode_only"`, `applyModelDefaults` activates the local Codex-style JavaScript runtime automatically. The model sees `exec` and `wait` instead of each ordinary local function tool; calls made through `tools.*` still pass through the same Swift registry, approvals, and sandbox policy.
+
+Tools can opt into the same exposure controls used by Codex:
+
+```swift
+let definition = ToolDefinition(
+    name: "lookup_symbol",
+    description: "Looks up a symbol.",
+    parameters: ToolSchemas.object(properties: [:]),
+    exposure: .deferred // available in ALL_TOOLS and tools.*, not directly
+)
+
+// Other choices: .direct, .directModelOnly, and .hidden.
+var config = AgentConfiguration(toolMode: .codeModeOnly)
+```
+
+Each `exec` call runs in a fresh JavaScriptCore context without Node, filesystem, network, or console globals. It supports async nested tool calls, `text`, `image`, `generatedImage`, `notify`, session `store`/`load`, timers, `exit`, `yield_control`, the upstream Lark grammar, first-line execution pragmas, and yielded cells that can be polled or terminated with `wait`.
 
 ## Quick start with API-key auth
 

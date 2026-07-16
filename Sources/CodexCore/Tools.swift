@@ -10,6 +10,7 @@ public struct ToolDefinition: Codable, Sendable, Equatable {
     public var deferLoading: Bool?
     public var requiresApproval: Bool
     public var isStateChanging: Bool
+    public var exposure: ToolExposure?
 
     public init(
         name: String,
@@ -20,7 +21,8 @@ public struct ToolDefinition: Codable, Sendable, Equatable {
         allowedCallers: [ResponseToolCaller]? = nil,
         deferLoading: Bool? = nil,
         requiresApproval: Bool = false,
-        isStateChanging: Bool = false
+        isStateChanging: Bool = false,
+        exposure: ToolExposure? = .direct
     ) {
         self.name = name
         self.description = description
@@ -31,6 +33,7 @@ public struct ToolDefinition: Codable, Sendable, Equatable {
         self.deferLoading = deferLoading
         self.requiresApproval = requiresApproval
         self.isStateChanging = isStateChanging
+        self.exposure = exposure
     }
 
     public var responseTool: ResponseToolDefinition {
@@ -44,6 +47,17 @@ public struct ToolDefinition: Codable, Sendable, Equatable {
             deferLoading: deferLoading
         )
     }
+}
+
+public enum ToolExposure: String, Codable, Sendable, Equatable, CaseIterable {
+    /// Direct model tool and available from code mode.
+    case direct
+    /// Hidden from the ordinary tool list and discoverable from code mode.
+    case deferred
+    /// Direct model tool that is intentionally unavailable to nested code.
+    case directModelOnly = "direct_model_only"
+    /// Never exposed to the model or code-mode runtime.
+    case hidden
 }
 
 public struct ToolResult: Codable, Sendable, Equatable {

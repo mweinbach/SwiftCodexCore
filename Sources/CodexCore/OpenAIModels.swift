@@ -326,6 +326,10 @@ public extension AgentConfiguration {
         if serviceTier == nil {
             serviceTier = info.defaultServiceTier
         }
+        if toolMode == nil, let advertisedToolMode = info.toolMode,
+           let mode = AgentToolMode(rawValue: advertisedToolMode) {
+            toolMode = mode
+        }
         if configureCompaction, contextManagement == nil, let threshold = info.automaticCompactionTokenLimit {
             contextManagement = [ResponseContextManagement(compactThreshold: threshold)]
         }

@@ -55,6 +55,7 @@ public final class CodexAgent: Sendable {
     private let toolRegistry: ToolRegistry
     private let threadManager: ThreadManager
     private let approvalHandler: ApprovalHandler?
+    private let codeModeRuntime: CodeModeRuntime
 
     public init(
         configuration: AgentConfiguration = AgentConfiguration(),
@@ -68,6 +69,7 @@ public final class CodexAgent: Sendable {
         self.toolRegistry = toolRegistry
         self.threadManager = threadManager
         self.approvalHandler = approvalHandler
+        self.codeModeRuntime = CodeModeRuntime(registry: toolRegistry)
     }
 
     public func createThread(title: String? = nil, metadata: [String: JSONValue] = [:]) async throws -> AgentThread {
@@ -156,8 +158,23 @@ public final class CodexAgent: Sendable {
                 }
             }
 
-            let localToolDefinitions = await toolRegistry.listDefinitions().map(\.responseTool)
-            let toolDefinitions = toolsAllowedBySandbox(localToolDefinitions + configuration.serverTools)
+            let registeredToolDefinitions = await toolRegistry.listDefinitions()
+            let directLocalTools: [ResponseToolDefinition]
+            switch configuration.toolMode ?? .direct {
+            case .direct:
+                directLocalTools = registeredToolDefinitions
+                    .filter { ($0.exposure ?? .direct) == .direct || $0.exposure == .directModelOnly }
+                    .map(\.responseTool)
+            case .codeMode:
+                directLocalTools = registeredToolDefinitions
+                    .filter { ($0.exposure ?? .direct) == .direct || $0.exposure == .directModelOnly }
+                    .map(\.responseTool) + CodeModeRuntime.responseTools(definitions: registeredToolDefinitions)
+            case .codeModeOnly:
+                directLocalTools = registeredToolDefinitions
+                    .filter { $0.exposure == .directModelOnly }
+                    .map(\.responseTool) + CodeModeRuntime.responseTools(definitions: registeredToolDefinitions)
+            }
+            let toolDefinitions = toolsAllowedBySandbox(directLocalTools + configuration.serverTools)
             let useResponseContinuation = nextInputUsesPreviousResponse && modelProvider.supportsResponseContinuation
             let reasoningSummary = configuration.multiAgent?.enabled == true ? nil : configuration.reasoningSummary
             let request = ResponsesRequest(
@@ -285,14 +302,14 @@ public final class CodexAgent: Sendable {
                             "name": .string(call.name),
                             "arguments": .string(call.arguments),
                             "raw_arguments": call.rawArguments ?? .null,
-                            "caller": call.caller ?? .null
+                            "caller": call.caller ?? .null,
+                            "tool_call_kind": .string((call.kind ?? .function).rawValue)
                         ])
                     )
                     try await threadManager.appendItem(callItem, to: threadID)
                     continuation.yield(.toolStarted(call: call))
                     continuation.yield(.itemCompleted(callItem))
 
-                    let arguments = try decodeArguments(call)
                     let context = ToolExecutionContext(
                         threadID: threadID,
                         turnID: turnID,
@@ -306,10 +323,24 @@ public final class CodexAgent: Sendable {
                         metadata: ["tool_call_id": .string(call.callID)]
                     )
                     let result: ToolResult
-                    do {
-                        result = try await toolRegistry.run(name: call.name, arguments: arguments, context: context)
-                    } catch {
-                        result = ToolResult(content: String(describing: error), isError: true)
+                    if call.kind == .custom && call.name == CodeModeRuntime.execToolName {
+                        result = await codeModeRuntime.execute(
+                            source: call.arguments,
+                            definitions: registeredToolDefinitions,
+                            context: context
+                        )
+                    } else {
+                        do {
+                            let arguments = try decodeArguments(call)
+                            if call.name == CodeModeRuntime.waitToolName,
+                               (configuration.toolMode ?? .direct) != .direct {
+                                result = await codeModeRuntime.wait(arguments: arguments)
+                            } else {
+                                result = try await toolRegistry.run(name: call.name, arguments: arguments, context: context)
+                            }
+                        } catch {
+                            result = ToolResult(content: String(describing: error), isError: true)
+                        }
                     }
                     let resultItem = ThreadItem(
                         threadID: threadID,
@@ -323,13 +354,18 @@ public final class CodexAgent: Sendable {
                             "structured_content": result.structuredContent ?? .null,
                             "is_error": .bool(result.isError),
                             "metadata": .object(result.metadata),
-                            "caller": call.caller ?? .null
+                            "caller": call.caller ?? .null,
+                            "tool_call_kind": .string((call.kind ?? .function).rawValue)
                         ])
                     )
                     try await threadManager.appendItem(resultItem, to: threadID)
                     continuation.yield(.toolCompleted(call: call, result: result))
                     continuation.yield(.itemCompleted(resultItem))
-                    toolOutputs.append(ResponseInputBuilder.functionCallOutput(callID: call.callID, output: result.content, caller: call.caller))
+                    if call.kind == .custom {
+                        toolOutputs.append(ResponseInputBuilder.customToolCallOutput(callID: call.callID, output: result.content))
+                    } else {
+                        toolOutputs.append(ResponseInputBuilder.functionCallOutput(callID: call.callID, output: result.content, caller: call.caller))
+                    }
                 }
                 if lastResponseID != nil && modelProvider.supportsResponseContinuation {
                     responseInputs = toolOutputs
@@ -392,7 +428,8 @@ public final class CodexAgent: Sendable {
                         name: name,
                         arguments: arguments,
                         rawArguments: item.payload["raw_arguments"],
-                        caller: nonNull(item.payload["caller"])
+                        caller: nonNull(item.payload["caller"]),
+                        kind: ToolCallKind(rawValue: item.payload["tool_call_kind"]?.stringValue ?? "function") ?? .function
                     )))
                 }
             case .dynamicToolCall, .reasoning, .contextCompaction:
@@ -408,13 +445,19 @@ public final class CodexAgent: Sendable {
                         name: name,
                         arguments: arguments,
                         rawArguments: item.payload["raw_arguments"],
-                        caller: nonNull(item.payload["caller"])
+                        caller: nonNull(item.payload["caller"]),
+                        kind: ToolCallKind(rawValue: item.payload["tool_call_kind"]?.stringValue ?? "function") ?? .function
                     )))
                 }
             case .toolResult:
                 if let callID = item.payload["call_id"]?.stringValue,
                    let content = item.payload["content"]?.stringValue {
-                    input.append(ResponseInputBuilder.functionCallOutput(callID: callID, output: content, caller: nonNull(item.payload["caller"])))
+                    let kind = ToolCallKind(rawValue: item.payload["tool_call_kind"]?.stringValue ?? "function") ?? .function
+                    if kind == .custom {
+                        input.append(ResponseInputBuilder.customToolCallOutput(callID: callID, output: content))
+                    } else {
+                        input.append(ResponseInputBuilder.functionCallOutput(callID: callID, output: content, caller: nonNull(item.payload["caller"])))
+                    }
                 }
             case .webSearch, .imageGeneration:
                 if let item = item.payload["item"],

@@ -538,7 +538,7 @@ final class CodexCoreTests: XCTestCase {
                 return StubURLProtocol.response(
                     for: request,
                     headers: ["ETag": etag],
-                    json: #"{"models":[{"slug":"gpt-dynamic","display_name":"Dynamic","default_reasoning_level":"max","supported_reasoning_levels":[{"effort":"low"},{"effort":"max"}],"context_window":400000,"visibility":"list","priority":1,"supported_in_api":true,"supports_image_detail_original":true,"multi_agent_version":"v3","future_capability":{"enabled":true}}]}"#
+                    json: #"{"models":[{"slug":"gpt-dynamic","display_name":"Dynamic","default_reasoning_level":"max","supported_reasoning_levels":[{"effort":"low"},{"effort":"max"}],"context_window":400000,"visibility":"list","priority":1,"supported_in_api":true,"supports_image_detail_original":true,"tool_mode":"code_mode_only","multi_agent_version":"v3","future_capability":{"enabled":true}}]}"#
                 )
             case ("POST", "/backend-api/codex/responses"):
                 return StubURLProtocol.response(
@@ -580,6 +580,7 @@ final class CodexCoreTests: XCTestCase {
         XCTAssertEqual(dynamicConfiguration.model, "gpt-dynamic")
         XCTAssertEqual(dynamicConfiguration.reasoningEffort, .max)
         XCTAssertEqual(dynamicConfiguration.contextManagement?.first?.compactThreshold, 360_000)
+        XCTAssertEqual(dynamicConfiguration.toolMode, .codeModeOnly)
 
         let client = OpenAIResponsesClient(
             auth: StaticAuthProvider(),
@@ -1161,6 +1162,116 @@ final class CodexCoreTests: XCTestCase {
         XCTAssertEqual(digest, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
     }
 
+    func testCodeModeOnlyExecutesNestedToolsAndUsesCustomOutput() async throws {
+        let provider = RecordingModelProvider(
+            batches: [
+                [
+                    .toolCallCompleted(ToolCall(
+                        id: "ctc_exec",
+                        callID: "call_exec",
+                        name: "exec",
+                        arguments: #"text(await tools.echo({text: "nested pong"}));"#,
+                        kind: .custom
+                    )),
+                    .completed(responseID: "r1", usage: nil)
+                ],
+                [.outputTextDelta("done"), .completed(responseID: "r2", usage: nil)]
+            ],
+            supportsResponseContinuation: false
+        )
+        let configuration = AgentConfiguration(toolMode: .codeModeOnly)
+        let agent = CodexAgent(
+            configuration: configuration,
+            modelProvider: provider,
+            toolRegistry: ToolRegistry(tools: [EchoTool()]),
+            threadManager: ThreadManager(store: InMemoryThreadStore())
+        )
+        let thread = try await agent.createThread()
+        for try await _ in agent.startTurn(threadID: thread.id, input: TurnInput("ping through code mode")).events {}
+
+        XCTAssertEqual(provider.requests.count, 2)
+        XCTAssertEqual(provider.requests[0].tools.map(\.type), ["custom", "function"])
+        XCTAssertEqual(provider.requests[0].tools.compactMap(\.name), ["exec", "wait"])
+        XCTAssertFalse(provider.requests[0].tools.contains { $0.name == "echo" })
+        let customOutput = try XCTUnwrap(provider.requests[1].input.first { $0["type"]?.stringValue == "custom_tool_call_output" })
+        XCTAssertEqual(customOutput["call_id"]?.stringValue, "call_exec")
+        XCTAssertEqual(customOutput["output"]?.stringValue, "nested pong")
+    }
+
+    func testCodeModeExposureKeepsDirectModelOnlyToolVisible() async throws {
+        let provider = RecordingModelProvider(batches: [[.completed(responseID: "r1", usage: nil)]])
+        let agent = CodexAgent(
+            configuration: AgentConfiguration(toolMode: .codeModeOnly),
+            modelProvider: provider,
+            toolRegistry: ToolRegistry(tools: [DirectModelOnlyTool(), EchoTool()]),
+            threadManager: ThreadManager(store: InMemoryThreadStore())
+        )
+        let thread = try await agent.createThread()
+        for try await _ in agent.startTurn(threadID: thread.id, input: TurnInput("inspect tools")).events {}
+
+        XCTAssertEqual(Set(provider.requests[0].tools.compactMap(\.name)), Set(["exec", "wait", "direct_only"]))
+    }
+
+    func testResponsesSnapshotParsesCustomToolCall() throws {
+        let raw: JSONValue = .object([
+            "id": .string("resp_custom"),
+            "output": .array([.object([
+                "type": .string("custom_tool_call"),
+                "id": .string("ctc_1"),
+                "call_id": .string("call_1"),
+                "name": .string("exec"),
+                "input": .string("text('ok')")
+            ])])
+        ])
+        let snapshot = OpenAIResponseSnapshot(raw: raw)
+        let events = try OpenAIResponsesClient.modelEvents(from: snapshot)
+        let call = try XCTUnwrap(events.compactMap { event -> ToolCall? in
+            if case .toolCallCompleted(let call) = event { return call }
+            return nil
+        }.first)
+        XCTAssertEqual(call.kind, .custom)
+        XCTAssertEqual(call.arguments, "text('ok')")
+    }
+
+    func testCodeModeWaitAndThreadScopedStore() async throws {
+        let runtime = CodeModeRuntime(registry: ToolRegistry(tools: [EchoTool()]))
+        let context = ToolExecutionContext(
+            threadID: "thread-code-mode",
+            turnID: "turn-1",
+            approvalPolicy: .never,
+            sandboxPolicy: .workspaceWrite
+        )
+        let definitions = [EchoTool().definition]
+        let first = await runtime.execute(
+            source: "store('answer', 42); text('stored');",
+            definitions: definitions,
+            context: context
+        )
+        XCTAssertEqual(first.content, "stored")
+        let second = await runtime.execute(
+            source: "text(load('answer'));",
+            definitions: definitions,
+            context: context
+        )
+        XCTAssertEqual(second.content, "42")
+
+        let yielded = await runtime.execute(
+            source: """
+            // @exec: {"yield_time_ms":250}
+            await new Promise(resolve => setTimeout(() => { text('later'); resolve(); }, 400));
+            """,
+            definitions: definitions,
+            context: context
+        )
+        XCTAssertEqual(yielded.metadata["running"]?.boolValue, true)
+        let cellID = try XCTUnwrap(yielded.metadata["cell_id"]?.stringValue)
+        let completed = await runtime.wait(arguments: .object([
+            "cell_id": .string(cellID),
+            "yield_time_ms": .number(1_000)
+        ]))
+        XCTAssertEqual(completed.content, "later")
+    }
+
     private static func fakeJWT(payload: JSONValue) throws -> String {
         let header = try JSONEncoder.codexCompact.encode(JSONValue.object(["alg": .string("none")]))
         let payloadData = try JSONEncoder.codexCompact.encode(payload)
@@ -1230,6 +1341,19 @@ private struct ApprovalEchoTool: AgentTool {
 
     func run(arguments: JSONValue, context: ToolExecutionContext) async throws -> ToolResult {
         ToolResult(content: try arguments.requiredString("text"))
+    }
+}
+
+private struct DirectModelOnlyTool: AgentTool {
+    let definition = ToolDefinition(
+        name: "direct_only",
+        description: "Must be called directly by the model.",
+        parameters: ToolSchemas.object(properties: [:]),
+        exposure: .directModelOnly
+    )
+
+    func run(arguments: JSONValue, context: ToolExecutionContext) async throws -> ToolResult {
+        ToolResult(content: "direct")
     }
 }
 

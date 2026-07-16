@@ -175,6 +175,9 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
     public var projectInstructionOptions: ProjectInstructionOptions
     public var skillOptions: SkillInjectionOptions
     public var serverTools: [ResponseToolDefinition]
+    /// Controls whether local tools are exposed directly or through Codex's
+    /// JavaScript `exec` runtime. Dynamic model metadata can set this value.
+    public var toolMode: AgentToolMode?
 
     public init(
         model: String = OpenAIModel.gpt56Sol.rawValue,
@@ -205,7 +208,8 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
         backgroundAccessEnabled: Bool = false,
         projectInstructionOptions: ProjectInstructionOptions = ProjectInstructionOptions(),
         skillOptions: SkillInjectionOptions = SkillInjectionOptions(),
-        serverTools: [ResponseToolDefinition] = []
+        serverTools: [ResponseToolDefinition] = [],
+        toolMode: AgentToolMode? = nil
     ) {
         self.model = model
         self.instructions = instructions
@@ -236,7 +240,14 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
         self.projectInstructionOptions = projectInstructionOptions
         self.skillOptions = skillOptions
         self.serverTools = serverTools
+        self.toolMode = toolMode
     }
+}
+
+public enum AgentToolMode: String, Codable, Sendable, Equatable, CaseIterable {
+    case direct
+    case codeMode = "code_mode"
+    case codeModeOnly = "code_mode_only"
 }
 
 public enum ReasoningEffort: String, Codable, Sendable, Equatable, CaseIterable {
@@ -322,6 +333,7 @@ public struct ToolCall: Codable, Sendable, Equatable, Identifiable {
     public var rawArguments: JSONValue?
     /// Opaque Responses linkage for calls made from hosted programs or agents.
     public var caller: JSONValue?
+    public var kind: ToolCallKind?
 
     public init(
         id: String = UUID().uuidString,
@@ -329,7 +341,8 @@ public struct ToolCall: Codable, Sendable, Equatable, Identifiable {
         name: String,
         arguments: String,
         rawArguments: JSONValue? = nil,
-        caller: JSONValue? = nil
+        caller: JSONValue? = nil,
+        kind: ToolCallKind? = .function
     ) {
         self.id = id
         self.callID = callID
@@ -337,7 +350,13 @@ public struct ToolCall: Codable, Sendable, Equatable, Identifiable {
         self.arguments = arguments
         self.rawArguments = rawArguments
         self.caller = caller
+        self.kind = kind
     }
+}
+
+public enum ToolCallKind: String, Codable, Sendable, Equatable {
+    case function
+    case custom
 }
 
 public struct TokenUsage: Codable, Sendable, Equatable {
