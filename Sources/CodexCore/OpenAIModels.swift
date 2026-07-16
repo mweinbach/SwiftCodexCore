@@ -93,25 +93,137 @@ public enum OpenAIModelCatalogSource: String, Codable, Sendable, Equatable {
     case fallback
 }
 
+/// Describes whether bundled model metadata contributed to a resolved catalog.
+public enum OpenAIModelCatalogFallbackUsage: String, Codable, Sendable, Equatable {
+    case none
+    case merged
+    case exclusive
+}
+
+/// Identifies how the manager resolved its most recently observed catalog.
+public enum OpenAIModelCatalogResolutionSource: String, Codable, Sendable, Equatable {
+    case memoryCache
+    case diskCache
+    case network
+    case notModified
+    case etagValidated
+    case staleWhileRevalidate
+    case bundledFallback
+    case refreshFailure
+}
+
+/// Structured, host-visible state for catalog cache and fallback decisions.
+public struct OpenAIModelCatalogDiagnostics: Codable, Sendable, Equatable {
+    public var resolutionSource: OpenAIModelCatalogResolutionSource
+    public var catalogSource: OpenAIModelCatalogSource?
+    public var fallbackUsage: OpenAIModelCatalogFallbackUsage
+    public var endpoint: URL
+    public var clientVersion: String
+    public var etag: String?
+    public var isStale: Bool
+    public var isRefreshInFlight: Bool
+    public var errorDescription: String?
+    public var recordedAt: Date
+
+    public var usesBundledFallback: Bool { fallbackUsage != .none }
+
+    public init(
+        resolutionSource: OpenAIModelCatalogResolutionSource,
+        catalogSource: OpenAIModelCatalogSource?,
+        fallbackUsage: OpenAIModelCatalogFallbackUsage,
+        endpoint: URL,
+        clientVersion: String,
+        etag: String?,
+        isStale: Bool,
+        isRefreshInFlight: Bool,
+        errorDescription: String? = nil,
+        recordedAt: Date = Date()
+    ) {
+        self.resolutionSource = resolutionSource
+        self.catalogSource = catalogSource
+        self.fallbackUsage = fallbackUsage
+        self.endpoint = endpoint
+        self.clientVersion = clientVersion
+        self.etag = etag
+        self.isStale = isStale
+        self.isRefreshInFlight = isRefreshInFlight
+        self.errorDescription = errorDescription
+        self.recordedAt = recordedAt
+    }
+}
+
 public struct OpenAIModelCatalogSnapshot: Codable, Sendable, Equatable {
     public var models: [OpenAIModelInfo]
     public var etag: String?
     public var fetchedAt: Date
     public var clientVersion: String
     public var source: OpenAIModelCatalogSource
+    /// Canonical endpoint identity used to prevent a shared cache file from
+    /// being consumed by a different provider.
+    public var endpointIdentity: String?
+    /// Manager-produced snapshots set this explicitly; older decoded snapshots
+    /// infer it from their provider source.
+    public var fallbackUsage: OpenAIModelCatalogFallbackUsage
+
+    private enum CodingKeys: String, CodingKey {
+        case models
+        case etag
+        case fetchedAt
+        case clientVersion
+        case source
+        case endpointIdentity
+        case fallbackUsage
+    }
 
     public init(
         models: [OpenAIModelInfo],
         etag: String? = nil,
         fetchedAt: Date = Date(),
         clientVersion: String,
-        source: OpenAIModelCatalogSource
+        source: OpenAIModelCatalogSource,
+        endpointIdentity: String? = nil,
+        fallbackUsage: OpenAIModelCatalogFallbackUsage = .none
     ) {
         self.models = models
         self.etag = etag
         self.fetchedAt = fetchedAt
         self.clientVersion = clientVersion
         self.source = source
+        self.endpointIdentity = endpointIdentity
+        self.fallbackUsage = fallbackUsage
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        models = try container.decode([OpenAIModelInfo].self, forKey: .models)
+        etag = try container.decodeIfPresent(String.self, forKey: .etag)
+        fetchedAt = try container.decode(Date.self, forKey: .fetchedAt)
+        clientVersion = try container.decode(String.self, forKey: .clientVersion)
+        source = try container.decode(OpenAIModelCatalogSource.self, forKey: .source)
+        endpointIdentity = try container.decodeIfPresent(String.self, forKey: .endpointIdentity)
+        fallbackUsage = try container.decodeIfPresent(OpenAIModelCatalogFallbackUsage.self, forKey: .fallbackUsage)
+            ?? Self.inferredFallbackUsage(for: source)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(models, forKey: .models)
+        try container.encodeIfPresent(etag, forKey: .etag)
+        try container.encode(fetchedAt, forKey: .fetchedAt)
+        try container.encode(clientVersion, forKey: .clientVersion)
+        try container.encode(source, forKey: .source)
+        try container.encodeIfPresent(endpointIdentity, forKey: .endpointIdentity)
+        try container.encode(fallbackUsage, forKey: .fallbackUsage)
+    }
+
+    private static func inferredFallbackUsage(
+        for source: OpenAIModelCatalogSource
+    ) -> OpenAIModelCatalogFallbackUsage {
+        switch source {
+        case .codex: return .none
+        case .openAI: return .merged
+        case .fallback: return .exclusive
+        }
     }
 
     public func model(id: String) -> OpenAIModelInfo? {
@@ -127,8 +239,13 @@ public struct OpenAIModelCatalogSnapshot: Codable, Sendable, Equatable {
 }
 
 public enum OpenAIModelCatalogRefreshStrategy: Sendable, Equatable {
+    /// Always waits for the single-flight network refresh, using a cached ETag
+    /// for conditional validation when available.
     case online
+    /// Never accesses the network and may return a stale matching cache.
     case offline
+    /// Returns a fresh cache, or returns stale data immediately while one
+    /// single-flight refresh proceeds in the background.
     case onlineIfUncached
 }
 
@@ -169,7 +286,9 @@ public actor OpenAIModelsManager {
     private let session: URLSession
     private let fallbackModels: [OpenAIModelInfo]
     private var current: OpenAIModelCatalogSnapshot?
+    private var refreshTask: Task<OpenAIModelCatalogSnapshot, Error>?
     public private(set) var lastRefreshError: String?
+    public private(set) var lastDiagnostics: OpenAIModelCatalogDiagnostics?
 
     public init(
         auth: any AuthorizationProvider,
@@ -184,47 +303,147 @@ public actor OpenAIModelsManager {
     }
 
     public func catalog(_ strategy: OpenAIModelCatalogRefreshStrategy = .onlineIfUncached) async -> OpenAIModelCatalogSnapshot {
-        if strategy != .online, let current, isFresh(current) {
-            return current
+        switch strategy {
+        case .offline:
+            if let current, isValidResolvedSnapshot(current) {
+                recordDiagnostics(
+                    resolutionSource: current.source == .fallback ? .bundledFallback : .memoryCache,
+                    snapshot: current,
+                    isStale: !isFresh(current)
+                )
+                return current
+            }
+            if let cached = loadCache() {
+                current = cached
+                recordDiagnostics(resolutionSource: .diskCache, snapshot: cached, isStale: !isFresh(cached))
+                return cached
+            }
+            return resolvedFallbackSnapshot()
+
+        case .onlineIfUncached:
+            if let current, current.source != .fallback, isFresh(current) {
+                recordDiagnostics(resolutionSource: .memoryCache, snapshot: current, isStale: false)
+                return current
+            }
+            if let cached = loadFreshCache() {
+                current = cached
+                recordDiagnostics(resolutionSource: .diskCache, snapshot: cached, isStale: false)
+                return cached
+            }
+            if let stale = staleSnapshot() {
+                current = stale
+                recordDiagnostics(
+                    resolutionSource: .staleWhileRevalidate,
+                    snapshot: stale,
+                    isStale: true,
+                    isRefreshInFlight: true
+                )
+                scheduleBackgroundRefresh()
+                return stale
+            }
+
+        case .online:
+            break
         }
-        if strategy != .online, let cached = loadFreshCache() {
-            current = cached
-            return cached
-        }
-        guard strategy != .offline else { return fallbackSnapshot() }
+
         do {
             return try await refresh()
         } catch {
-            lastRefreshError = String(describing: error)
-            if let current { return current }
-            if let cached = loadCache() { return cached }
-            return fallbackSnapshot()
+            if let current, isValidResolvedSnapshot(current), current.source != .fallback {
+                recordDiagnostics(
+                    resolutionSource: .memoryCache,
+                    snapshot: current,
+                    isStale: !isFresh(current),
+                    error: error
+                )
+                return current
+            }
+            if let cached = loadCache() {
+                current = cached
+                recordDiagnostics(
+                    resolutionSource: .diskCache,
+                    snapshot: cached,
+                    isStale: !isFresh(cached),
+                    error: error
+                )
+                return cached
+            }
+            return resolvedFallbackSnapshot(error: error)
         }
     }
 
     @discardableResult
     public func refresh() async throws -> OpenAIModelCatalogSnapshot {
-        let remote = try await fetch(allowRefresh: true)
-        let merged = merge(remote)
-        current = merged
-        lastRefreshError = nil
-        try persist(merged)
-        return merged
+        if let refreshTask {
+            return try await refreshTask.value
+        }
+
+        let task = Task { try await self.performRefresh() }
+        refreshTask = task
+        do {
+            let snapshot = try await task.value
+            refreshTask = nil
+            return snapshot
+        } catch {
+            refreshTask = nil
+            lastRefreshError = String(describing: error)
+            let existing = current ?? loadCache()
+            recordDiagnostics(
+                resolutionSource: .refreshFailure,
+                snapshot: existing,
+                isStale: existing.map { !isFresh($0) } ?? false,
+                error: error
+            )
+            throw error
+        }
     }
 
     public func refreshIfNewETag(_ etag: String) async {
-        if current?.etag == etag {
-            if var current {
-                current.fetchedAt = Date()
-                self.current = current
-                try? persist(current)
-            }
+        if var snapshot = conditionalSnapshot(), snapshot.etag == etag {
+            snapshot.fetchedAt = Date()
+            current = snapshot
+            lastRefreshError = nil
+            try? persist(snapshot)
+            recordDiagnostics(resolutionSource: .etagValidated, snapshot: snapshot, isStale: false)
             return
         }
         _ = await catalog(.online)
     }
 
-    private func fetch(allowRefresh: Bool) async throws -> OpenAIModelCatalogSnapshot {
+    private enum FetchResult {
+        case modified(OpenAIModelCatalogSnapshot)
+        case notModified(etag: String?)
+    }
+
+    private func performRefresh() async throws -> OpenAIModelCatalogSnapshot {
+        let conditional = conditionalSnapshot()
+        let result = try await fetch(allowRefresh: true, ifNoneMatch: conditional?.etag)
+        let snapshot: OpenAIModelCatalogSnapshot
+        let resolutionSource: OpenAIModelCatalogResolutionSource
+
+        switch result {
+        case .modified(let remote):
+            snapshot = merge(remote)
+            resolutionSource = .network
+
+        case .notModified(let etag):
+            guard var conditional else {
+                throw CodexCoreError.transportError("Models API returned 304 without a matching cached catalog")
+            }
+            conditional.etag = etag ?? conditional.etag
+            conditional.fetchedAt = Date()
+            snapshot = conditional
+            resolutionSource = .notModified
+        }
+
+        current = snapshot
+        lastRefreshError = nil
+        try persist(snapshot)
+        recordDiagnostics(resolutionSource: resolutionSource, snapshot: snapshot, isStale: false)
+        return snapshot
+    }
+
+    private func fetch(allowRefresh: Bool, ifNoneMatch: String?) async throws -> FetchResult {
         var components = URLComponents(url: options.endpoint, resolvingAgainstBaseURL: false)
         var query = components?.queryItems ?? []
         query.removeAll { $0.name == "client_version" }
@@ -236,6 +455,9 @@ public actor OpenAIModelsManager {
         var request = URLRequest(url: url, timeoutInterval: options.requestTimeout)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let ifNoneMatch, !ifNoneMatch.isEmpty {
+            request.setValue(ifNoneMatch, forHTTPHeaderField: "If-None-Match")
+        }
         for (key, value) in try await auth.authorizationHeaders() { request.setValue(value, forHTTPHeaderField: key) }
         for (key, value) in options.extraHeaders { request.setValue(value, forHTTPHeaderField: key) }
 
@@ -245,7 +467,10 @@ public actor OpenAIModelsManager {
         }
         if http.statusCode == 401, allowRefresh, let refreshing = auth as? any TokenRefreshingAuthorizationProvider {
             try await refreshing.refreshNow()
-            return try await fetch(allowRefresh: false)
+            return try await fetch(allowRefresh: false, ifNoneMatch: ifNoneMatch)
+        }
+        if http.statusCode == 304 {
+            return .notModified(etag: http.value(forHTTPHeaderField: "ETag"))
         }
         guard (200..<300).contains(http.statusCode) else {
             throw CodexCoreError.transportError("Models API HTTP \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "")")
@@ -259,38 +484,57 @@ public actor OpenAIModelsManager {
         }
         let source: OpenAIModelCatalogSource = codexModels != nil ? .codex : .openAI
         let values = codexModels ?? platformModels ?? []
-        let models = values.compactMap { value -> OpenAIModelInfo? in
-            guard case .object(let fields) = value else { return nil }
-            return OpenAIModelInfo(fields: fields)
-        }
-        return OpenAIModelCatalogSnapshot(
+        let models = try validatedModels(values)
+        return .modified(OpenAIModelCatalogSnapshot(
             models: models,
             etag: http.value(forHTTPHeaderField: "ETag"),
             clientVersion: options.clientVersion,
-            source: source
-        )
+            source: source,
+            endpointIdentity: endpointIdentity,
+            fallbackUsage: .none
+        ))
     }
 
     private func merge(_ remote: OpenAIModelCatalogSnapshot) -> OpenAIModelCatalogSnapshot {
         if remote.source == .codex,
            remote.models.contains(where: { $0.visibility == nil || $0.visibility == "list" }) {
-            return remote
+            var authoritative = remote
+            authoritative.fallbackUsage = .none
+            return authoritative
         }
-        var byID = Dictionary(uniqueKeysWithValues: fallbackModels.map { ($0.slug, $0) })
+        var byID: [String: OpenAIModelInfo] = [:]
+        var usedFallback = false
+        for model in fallbackModels where Self.isValidModel(model) {
+            byID[model.slug] = model
+            usedFallback = true
+        }
         for model in remote.models {
             byID[model.slug] = byID[model.slug]?.mergingRemoteFields(model) ?? model
         }
         var merged = remote
         merged.models = Array(byID.values).sorted { ($0.priority ?? .max) < ($1.priority ?? .max) }
+        merged.fallbackUsage = usedFallback ? .merged : .none
         return merged
     }
 
     private func fallbackSnapshot() -> OpenAIModelCatalogSnapshot {
-        OpenAIModelCatalogSnapshot(models: fallbackModels, clientVersion: options.clientVersion, source: .fallback)
+        var seen = Set<String>()
+        let validFallbacks = fallbackModels.filter { model in
+            Self.isValidModel(model) && seen.insert(model.slug).inserted
+        }
+        return OpenAIModelCatalogSnapshot(
+            models: validFallbacks,
+            clientVersion: options.clientVersion,
+            source: .fallback,
+            endpointIdentity: endpointIdentity,
+            fallbackUsage: .exclusive
+        )
     }
 
     private func isFresh(_ snapshot: OpenAIModelCatalogSnapshot) -> Bool {
-        snapshot.clientVersion == options.clientVersion && Date().timeIntervalSince(snapshot.fetchedAt) <= options.cacheTTL
+        guard isValidResolvedSnapshot(snapshot) else { return false }
+        let age = Date().timeIntervalSince(snapshot.fetchedAt)
+        return age >= -60 && age <= options.cacheTTL
     }
 
     private func loadFreshCache() -> OpenAIModelCatalogSnapshot? {
@@ -301,7 +545,8 @@ public actor OpenAIModelsManager {
         guard let url = options.cacheURL,
               let data = try? Data(contentsOf: url),
               let snapshot = try? JSONDecoder.codex.decode(OpenAIModelCatalogSnapshot.self, from: data),
-              snapshot.clientVersion == options.clientVersion else { return nil }
+              snapshot.source != .fallback,
+              isValidResolvedSnapshot(snapshot) else { return nil }
         return snapshot
     }
 
@@ -309,6 +554,123 @@ public actor OpenAIModelsManager {
         guard let url = options.cacheURL else { return }
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONEncoder.codexPretty.encode(snapshot).write(to: url, options: .atomic)
+    }
+
+    private var endpointIdentity: String {
+        guard var components = URLComponents(url: options.endpoint, resolvingAgainstBaseURL: false) else {
+            return options.endpoint.absoluteString
+        }
+        components.fragment = nil
+        components.scheme = components.scheme?.lowercased()
+        components.host = components.host?.lowercased()
+        if (components.scheme == "https" && components.port == 443)
+            || (components.scheme == "http" && components.port == 80) {
+            components.port = nil
+        }
+        let query = (components.queryItems ?? [])
+            .filter { $0.name != "client_version" }
+            .sorted {
+                if $0.name == $1.name { return ($0.value ?? "") < ($1.value ?? "") }
+                return $0.name < $1.name
+            }
+        components.queryItems = query.isEmpty ? nil : query
+        return components.url?.absoluteString ?? options.endpoint.absoluteString
+    }
+
+    private func conditionalSnapshot() -> OpenAIModelCatalogSnapshot? {
+        if let current, current.source != .fallback, isValidResolvedSnapshot(current) {
+            return current
+        }
+        return loadCache()
+    }
+
+    private func staleSnapshot() -> OpenAIModelCatalogSnapshot? {
+        if let current, current.source != .fallback, isValidResolvedSnapshot(current) {
+            return current
+        }
+        return loadCache()
+    }
+
+    private func isValidResolvedSnapshot(_ snapshot: OpenAIModelCatalogSnapshot) -> Bool {
+        guard snapshot.clientVersion == options.clientVersion,
+              snapshot.endpointIdentity == endpointIdentity,
+              !snapshot.models.isEmpty else { return false }
+        var identifiers = Set<String>()
+        return snapshot.models.allSatisfy { model in
+            Self.isValidModel(model) && identifiers.insert(model.slug).inserted
+        }
+    }
+
+    private static func isValidModel(_ model: OpenAIModelInfo) -> Bool {
+        let identifier = model.slug
+        return identifier != "unknown"
+            && identifier == identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+            && !identifier.isEmpty
+            && identifier.rangeOfCharacter(from: .whitespacesAndNewlines) == nil
+            && identifier.rangeOfCharacter(from: .controlCharacters) == nil
+    }
+
+    private func validatedModels(_ values: [JSONValue]) throws -> [OpenAIModelInfo] {
+        guard !values.isEmpty else {
+            throw CodexCoreError.invalidJSON("Models response contained an empty catalog")
+        }
+        var identifiers = Set<String>()
+        return try values.enumerated().map { index, value in
+            guard case .object(let fields) = value else {
+                throw CodexCoreError.invalidJSON("Models response entry \(index) was not an object")
+            }
+            let model = OpenAIModelInfo(fields: fields)
+            guard Self.isValidModel(model) else {
+                throw CodexCoreError.invalidJSON("Models response entry \(index) did not contain a valid model identifier")
+            }
+            guard identifiers.insert(model.slug).inserted else {
+                throw CodexCoreError.invalidJSON("Models response contained duplicate model identifier `\(model.slug)`")
+            }
+            return model
+        }
+    }
+
+    private func scheduleBackgroundRefresh() {
+        Task { [weak self] in
+            guard let self else { return }
+            _ = try? await self.refresh()
+        }
+    }
+
+    private func resolvedFallbackSnapshot(error: Error? = nil) -> OpenAIModelCatalogSnapshot {
+        let snapshot = fallbackSnapshot()
+        current = snapshot
+        recordDiagnostics(
+            resolutionSource: .bundledFallback,
+            snapshot: snapshot,
+            isStale: false,
+            error: error
+        )
+        return snapshot
+    }
+
+    private func recordDiagnostics(
+        resolutionSource: OpenAIModelCatalogResolutionSource,
+        snapshot: OpenAIModelCatalogSnapshot?,
+        isStale: Bool,
+        isRefreshInFlight: Bool = false,
+        error: Error? = nil
+    ) {
+        lastDiagnostics = OpenAIModelCatalogDiagnostics(
+            resolutionSource: resolutionSource,
+            catalogSource: snapshot?.source,
+            fallbackUsage: fallbackUsage(for: snapshot),
+            endpoint: options.endpoint,
+            clientVersion: options.clientVersion,
+            etag: snapshot?.etag,
+            isStale: isStale,
+            isRefreshInFlight: isRefreshInFlight,
+            errorDescription: error.map { String(describing: $0) }
+        )
+    }
+
+    private func fallbackUsage(for snapshot: OpenAIModelCatalogSnapshot?) -> OpenAIModelCatalogFallbackUsage {
+        snapshot?.fallbackUsage ?? .none
     }
 }
 
