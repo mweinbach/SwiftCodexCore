@@ -1267,9 +1267,10 @@ final class CodexCoreTests: XCTestCase {
         let cellID = try XCTUnwrap(yielded.metadata["cell_id"]?.stringValue)
         let completed = await runtime.wait(arguments: .object([
             "cell_id": .string(cellID),
-            "yield_time_ms": .number(1_000)
+            "yield_time_ms": .number(1_000),
+            "max_tokens": .number(1)
         ]))
-        XCTAssertEqual(completed.content, "later")
+        XCTAssertEqual(completed.content, "late\n[output truncated]")
     }
 
     private static func fakeJWT(payload: JSONValue) throws -> String {

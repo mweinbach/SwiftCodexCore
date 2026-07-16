@@ -66,7 +66,9 @@ public actor CodeModeRuntime {
         if let result = await Self.firstResult(of: cell.task, afterMilliseconds: milliseconds) {
             cells.removeValue(forKey: cellID)
             mergeStore(from: result, threadID: cell.threadID)
-            return Self.withoutStoreMetadata(result)
+            let visible = Self.withoutStoreMetadata(result)
+            let maxTokens = max(1, min(arguments["max_tokens"]?.doubleValue.map(Int.init) ?? 10_000, 100_000))
+            return Self.limitingOutput(visible, maxTokens: maxTokens)
         }
         return ToolResult(
             content: "Script still running with cell ID \(cellID).",
@@ -160,6 +162,14 @@ public actor CodeModeRuntime {
     private static func withoutStoreMetadata(_ result: ToolResult) -> ToolResult {
         var copy = result
         copy.metadata.removeValue(forKey: "code_mode_store")
+        return copy
+    }
+
+    private static func limitingOutput(_ result: ToolResult, maxTokens: Int) -> ToolResult {
+        let characterLimit = maxTokens * 4
+        guard result.content.count > characterLimit else { return result }
+        var copy = result
+        copy.content = String(result.content.prefix(characterLimit)) + "\n[output truncated]"
         return copy
     }
 }
