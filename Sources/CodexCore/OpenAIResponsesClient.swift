@@ -212,6 +212,7 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
     private struct SSEParserState {
         var eventName: String?
         var dataLines: [String] = []
+        var outputItemAgents: [Int: String] = [:]
     }
 
     private static func parseSSE(bytes: URLSession.AsyncBytes, continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation) async throws {
@@ -256,7 +257,7 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
             state.dataLines.removeAll(keepingCapacity: true)
             defer { state.eventName = nil }
             if payload == "[DONE]" { return }
-            try emitEvent(named: state.eventName, dataString: payload, continuation: continuation)
+            try emitEvent(named: state.eventName, dataString: payload, continuation: continuation, state: &state)
         } else if line.hasPrefix(":") {
             return
         } else if line.hasPrefix("event:") {
@@ -287,18 +288,34 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         return responseSnapshot(from: json)
     }
 
-    private static func emitEvent(named eventName: String?, dataString: String, continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation) throws {
+    private static func emitEvent(
+        named eventName: String?,
+        dataString: String,
+        continuation: AsyncThrowingStream<ModelStreamEvent, Error>.Continuation,
+        state: inout SSEParserState
+    ) throws {
         guard let data = dataString.data(using: .utf8) else { return }
         let json = try JSONDecoder.codex.decode(JSONValue.self, from: data)
         let type = json["type"]?.stringValue ?? eventName ?? ""
-        for event in try eventsFromStreamObject(json, type: type) {
+        for event in try eventsFromStreamObject(json, type: type, state: &state) {
             continuation.yield(event)
         }
     }
 
-    private static func eventsFromStreamObject(_ json: JSONValue, type: String) throws -> [ModelStreamEvent] {
+    private static func eventsFromStreamObject(_ json: JSONValue, type: String, state: inout SSEParserState) throws -> [ModelStreamEvent] {
         switch type {
+        case "response.output_item.added":
+            if let outputIndex = json["output_index"]?.doubleValue.map(Int.init),
+               let item = json["item"] {
+                state.outputItemAgents[outputIndex] = agentName(from: item) ?? agentName(from: json) ?? "/root"
+            }
+            return [.raw(json)]
         case "response.output_text.delta":
+            if let outputIndex = json["output_index"]?.doubleValue.map(Int.init),
+               state.outputItemAgents[outputIndex] != nil,
+               state.outputItemAgents[outputIndex] != "/root" {
+                return [.raw(json)]
+            }
             return [.outputTextDelta(json["delta"]?.stringValue ?? "")]
         case "response.reasoning_summary_text.delta", "response.reasoning.delta", "response.output_text.annotation.added":
             return [.reasoningDelta(json["delta"]?.stringValue ?? "")]
@@ -314,7 +331,13 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
                 return [.serverToolCompleted(name: name, item: item)]
             }
             if let text = extractText(fromOutputItem: item), !text.isEmpty {
-                return [.messageCompleted(text)]
+                if isRootFinalMessage(item) {
+                    return [.messageCompleted(text)]
+                }
+                return [.responseItemCompleted(item)]
+            }
+            if ResponseInputBuilder.replayableServerToolOutput(item) != nil || isMultiAgentItem(item) {
+                return [.responseItemCompleted(item)]
             }
             return [.raw(json)]
         case "response.web_search_call.completed", "response.web_search_call.done":
@@ -345,8 +368,14 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
                 } else if let name = serverToolName(fromOutputItem: output) {
                     events.append(.serverToolCompleted(name: name, item: output))
                 } else if let text = extractText(fromOutputItem: output), !text.isEmpty {
-                    events.append(.messageCompleted(text))
-                    events.append(.outputTextDelta(text))
+                    if isRootFinalMessage(output) {
+                        events.append(.messageCompleted(text))
+                        events.append(.outputTextDelta(text))
+                    } else {
+                        events.append(.responseItemCompleted(output))
+                    }
+                } else if ResponseInputBuilder.replayableServerToolOutput(output) != nil || isMultiAgentItem(output) {
+                    events.append(.responseItemCompleted(output))
                 }
             }
         } else if let text = json["output_text"]?.stringValue {
@@ -395,7 +424,30 @@ public final class OpenAIResponsesClient: ModelProvider, Sendable {
         if type == "web_search_call" || type == "web_search" { return "web_search" }
         if type == "image_generation_call" || type == "image_generation" { return "image_generation" }
         if type == "mcp_call" || type == "tool_call" { return item["name"]?.stringValue ?? type }
+        if type.hasSuffix("_call"), !isMultiAgentItem(item) {
+            return String(type.dropLast(5))
+        }
         return nil
+    }
+
+    private static func agentName(from item: JSONValue) -> String? {
+        item["agent"]?["agent_name"]?.stringValue
+    }
+
+    private static func isRootFinalMessage(_ item: JSONValue) -> Bool {
+        guard item["type"]?.stringValue == "message" else { return false }
+        if let agent = agentName(from: item), agent != "/root" { return false }
+        if let phase = item["phase"]?.stringValue, phase != "final_answer" { return false }
+        return true
+    }
+
+    private static func isMultiAgentItem(_ item: JSONValue) -> Bool {
+        switch item["type"]?.stringValue {
+        case "multi_agent_call", "multi_agent_call_output", "agent_message":
+            return true
+        default:
+            return false
+        }
     }
 
     private static func extractText(fromOutputItem item: JSONValue) -> String? {

@@ -139,6 +139,45 @@ final class CodexCoreTests: XCTestCase {
         XCTAssertEqual(request.reasoning?.effort, "high")
         XCTAssertEqual(request.reasoning?.summary, "auto")
         XCTAssertEqual(request.store, false)
+        XCTAssertEqual(request.promptCacheKey, thread.id)
+        XCTAssertEqual(request.include, ["reasoning.encrypted_content"])
+    }
+
+    func testAgentLoopThreadsGPT56ControlsAndOmitsMultiAgentReasoningSummary() async throws {
+        let provider = RecordingModelProvider(batches: [
+            [.outputTextDelta("done"), .completed(responseID: "r1", usage: nil)]
+        ])
+        let config = AgentConfiguration(
+            model: OpenAIModel.gpt56Sol.rawValue,
+            reasoningEffort: .max,
+            reasoningSummary: .auto,
+            reasoningMode: .pro,
+            reasoningContext: .allTurns,
+            serviceTier: "priority",
+            promptCacheKey: "thread:stable",
+            promptCacheOptions: PromptCacheOptions(mode: .explicit),
+            safetyIdentifier: "stable-user-hash",
+            maxOutputTokens: 64_000,
+            multiAgent: MultiAgentConfiguration(maxConcurrentSubagents: 3),
+            responseIncludes: ["reasoning.encrypted_content"],
+            toolChoice: .string("auto"),
+            textOptions: ResponseTextOptions(verbosity: .low)
+        )
+        let runtime = CodexRuntime(configuration: config, modelProvider: provider, tools: [])
+        let thread = try await runtime.createThread()
+        let handle = try await runtime.startTurn(threadID: thread.id, input: TurnInput("go"))
+        for try await _ in handle.events {}
+
+        let request = try XCTUnwrap(provider.requests.first)
+        XCTAssertEqual(request.reasoning, ResponseReasoning(effort: "max", mode: "pro", context: "all_turns"))
+        XCTAssertNil(request.reasoning?.summary)
+        XCTAssertEqual(request.serviceTier, "priority")
+        XCTAssertEqual(request.promptCacheKey, "thread:stable")
+        XCTAssertEqual(request.promptCacheOptions, PromptCacheOptions(mode: .explicit))
+        XCTAssertEqual(request.safetyIdentifier, "stable-user-hash")
+        XCTAssertEqual(request.maxOutputTokens, 64_000)
+        XCTAssertEqual(request.multiAgent?.maxConcurrentSubagents, 3)
+        XCTAssertEqual(request.text?.verbosity, .low)
     }
 
     func testNetworkServerToolsAreFilteredWhenSandboxDisallowsNetwork() async throws {
@@ -247,6 +286,54 @@ final class CodexCoreTests: XCTestCase {
         let replayedToolCall = try XCTUnwrap(provider.requests[1].input.first { $0["type"]?.stringValue == "function_call" })
         XCTAssertEqual(replayedToolCall["id"]?.stringValue, "fc_echo")
         XCTAssertEqual(replayedToolCall["call_id"]?.stringValue, "call_echo")
+    }
+
+    func testProgrammaticToolContinuationPreservesCallerAndReplayableItems() async throws {
+        let caller: JSONValue = .object(["type": .string("program"), "caller_id": .string("call_program")])
+        let provider = RecordingModelProvider(
+            batches: [
+                [
+                    .responseItemCompleted(.object([
+                        "type": .string("program"),
+                        "id": .string("program_1"),
+                        "call_id": .string("call_program"),
+                        "code": .string("await tools.echo({ text: 'pong' })"),
+                        "fingerprint": .string("opaque")
+                    ])),
+                    .responseItemCompleted(.object([
+                        "type": .string("reasoning"),
+                        "id": .string("reasoning_1"),
+                        "encrypted_content": .string("encrypted")
+                    ])),
+                    .toolCallCompleted(ToolCall(
+                        id: "fc_program",
+                        callID: "call_echo",
+                        name: "echo",
+                        arguments: #"{"text":"pong"}"#,
+                        caller: caller
+                    )),
+                    .completed(responseID: "r1", usage: nil)
+                ],
+                [.outputTextDelta("pong"), .completed(responseID: "r2", usage: nil)]
+            ],
+            supportsResponseContinuation: false
+        )
+        let agent = CodexAgent(
+            modelProvider: provider,
+            toolRegistry: ToolRegistry(tools: [EchoTool()]),
+            threadManager: ThreadManager(store: InMemoryThreadStore())
+        )
+        let thread = try await agent.createThread()
+        let handle = agent.startTurn(threadID: thread.id, input: TurnInput("ping"))
+        for try await _ in handle.events {}
+
+        let replay = provider.requests[1].input
+        XCTAssertTrue(replay.contains { $0["type"]?.stringValue == "program" })
+        XCTAssertTrue(replay.contains { $0["type"]?.stringValue == "reasoning" })
+        let call = try XCTUnwrap(replay.first { $0["type"]?.stringValue == "function_call" })
+        let output = try XCTUnwrap(replay.first { $0["type"]?.stringValue == "function_call_output" })
+        XCTAssertEqual(call["caller"], caller)
+        XCTAssertEqual(output["caller"], caller)
     }
 
     func testHostedToolReplaySkipsProgressEvents() async throws {
@@ -500,6 +587,61 @@ final class CodexCoreTests: XCTestCase {
         ])
     }
 
+    func testMultiAgentStreamSeparatesSubagentAndRootOutput() async throws {
+        StubURLProtocol.handler = { request in
+            StubURLProtocol.response(
+                for: request,
+                contentType: "text/event-stream",
+                body: """
+                event: response.output_item.added
+                data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","phase":"commentary","agent":{"agent_name":"/root/reviewer"},"content":[]}}
+
+                event: response.output_text.delta
+                data: {"type":"response.output_text.delta","output_index":0,"delta":"private draft"}
+
+                event: response.output_item.done
+                data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","phase":"commentary","agent":{"agent_name":"/root/reviewer"},"content":[{"type":"output_text","text":"private draft"}]}}
+
+                event: response.output_item.added
+                data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","phase":"final_answer","agent":{"agent_name":"/root"},"content":[]}}
+
+                event: response.output_text.delta
+                data: {"type":"response.output_text.delta","output_index":1,"delta":"public answer"}
+
+                event: response.output_item.done
+                data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","phase":"final_answer","agent":{"agent_name":"/root"},"content":[{"type":"output_text","text":"public answer"}]}}
+
+                event: response.completed
+                data: {"type":"response.completed","response":{"id":"resp_multi"}}
+
+                """
+            )
+        }
+        defer { StubURLProtocol.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let client = OpenAIResponsesClient(auth: StaticAuthProvider(), session: URLSession(configuration: configuration))
+        let request = ResponsesRequest(
+            model: OpenAIModel.gpt56Sol.rawValue,
+            input: [ResponseInputBuilder.userMessage("review")],
+            multiAgent: MultiAgentConfiguration()
+        )
+        var events: [ModelStreamEvent] = []
+        for try await event in client.streamResponse(request) { events.append(event) }
+
+        XCTAssertTrue(events.contains(.outputTextDelta("public answer")))
+        XCTAssertTrue(events.contains(.messageCompleted("public answer")))
+        XCTAssertFalse(events.contains(.outputTextDelta("private draft")))
+        XCTAssertFalse(events.contains(.messageCompleted("private draft")))
+        XCTAssertTrue(events.contains { event in
+            if case .responseItemCompleted(let item) = event {
+                return item["agent"]?["agent_name"]?.stringValue == "/root/reviewer"
+            }
+            return false
+        })
+    }
+
     func testOpenAIResponsesClientBackgroundLifecycleUsesResponseEndpoints() async throws {
         let endpoint = URL(string: "https://example.test/v1/responses")!
         let requests = Locked<[CapturedHTTPRequest]>([])
@@ -599,6 +741,51 @@ final class CodexCoreTests: XCTestCase {
         })
         XCTAssertTrue(events.contains(.messageCompleted("done")))
         XCTAssertTrue(events.contains(.completed(responseID: "resp_123", usage: nil)))
+    }
+
+    func testMultiAgentSnapshotOnlyCompletesRootFinalMessage() throws {
+        let subagentMessage: JSONValue = .object([
+            "type": .string("message"),
+            "phase": .string("commentary"),
+            "agent": .object(["agent_name": .string("/root/reviewer")]),
+            "content": .array([.object(["type": .string("output_text"), "text": .string("private draft")])])
+        ])
+        let rootMessage: JSONValue = .object([
+            "type": .string("message"),
+            "phase": .string("final_answer"),
+            "agent": .object(["agent_name": .string("/root")]),
+            "content": .array([.object(["type": .string("output_text"), "text": .string("public answer")])])
+        ])
+        let snapshot = OpenAIResponseSnapshot(
+            id: "resp_multi",
+            status: "completed",
+            raw: .object([
+                "id": .string("resp_multi"),
+                "output": .array([subagentMessage, rootMessage]),
+                "usage": .object([
+                    "input_tokens": .number(10),
+                    "output_tokens": .number(5),
+                    "total_tokens": .number(15),
+                    "input_tokens_details": .object([
+                        "cached_tokens": .number(3),
+                        "cache_write_tokens": .number(4)
+                    ]),
+                    "output_tokens_details": .object(["reasoning_tokens": .number(2)])
+                ])
+            ])
+        )
+
+        let events = try OpenAIResponsesClient.modelEvents(from: snapshot)
+        XCTAssertTrue(events.contains(.responseItemCompleted(subagentMessage)))
+        XCTAssertTrue(events.contains(.messageCompleted("public answer")))
+        XCTAssertFalse(events.contains(.messageCompleted("private draft")))
+        let completion = try XCTUnwrap(events.last)
+        guard case .completed(_, let usage) = completion else {
+            return XCTFail("Expected completion event")
+        }
+        XCTAssertEqual(usage?.cachedInputTokens, 3)
+        XCTAssertEqual(usage?.cacheWriteTokens, 4)
+        XCTAssertEqual(usage?.reasoningOutputTokens, 2)
     }
 
     func testPromptAssemblyLoadsAgentsAndExplicitSkill() throws {

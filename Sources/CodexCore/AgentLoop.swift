@@ -122,6 +122,7 @@ public final class CodexAgent: Sendable {
         var finalUsage: TokenUsage?
         var status: TurnStatus = .completed
         var nextInputUsesPreviousResponse = false
+        let promptCacheKey = try await effectivePromptCacheKey(threadID: threadID)
 
         for iteration in 0..<configuration.maxToolIterations {
             if await control.isInterrupted() {
@@ -154,17 +155,32 @@ public final class CodexAgent: Sendable {
             let localToolDefinitions = await toolRegistry.listDefinitions().map(\.responseTool)
             let toolDefinitions = toolsAllowedBySandbox(localToolDefinitions + configuration.serverTools)
             let useResponseContinuation = nextInputUsesPreviousResponse && modelProvider.supportsResponseContinuation
+            let reasoningSummary = configuration.multiAgent?.enabled == true ? nil : configuration.reasoningSummary
             let request = ResponsesRequest(
                 model: configuration.model,
                 instructions: promptAssembly.instructions,
                 input: responseInputs,
                 tools: toolDefinitions,
                 stream: true,
-                reasoning: ResponseReasoning(effort: configuration.reasoningEffort, summary: configuration.reasoningSummary),
+                reasoning: ResponseReasoning(
+                    effort: configuration.reasoningEffort,
+                    summary: reasoningSummary,
+                    mode: configuration.reasoningMode,
+                    context: configuration.reasoningContext
+                ),
                 store: false,
                 previousResponseID: useResponseContinuation ? lastResponseID : nil,
                 metadata: ["thread_id": .string(threadID), "turn_id": .string(turnID), "iteration": .number(Double(iteration))],
-                parallelToolCalls: true
+                parallelToolCalls: true,
+                include: configuration.responseIncludes,
+                serviceTier: configuration.serviceTier,
+                promptCacheKey: promptCacheKey,
+                promptCacheOptions: configuration.promptCacheOptions,
+                safetyIdentifier: configuration.safetyIdentifier,
+                maxOutputTokens: configuration.maxOutputTokens,
+                toolChoice: configuration.toolChoice,
+                text: configuration.textOptions,
+                multiAgent: configuration.multiAgent
             )
             nextInputUsesPreviousResponse = false
 
@@ -210,6 +226,17 @@ public final class CodexAgent: Sendable {
                     )
                     try await threadManager.appendItem(serverItem, to: threadID)
                     continuation.yield(.itemCompleted(serverItem))
+                case .responseItemCompleted(let responseItem):
+                    let itemType = responseItem["type"]?.stringValue ?? "response_item"
+                    let responseItemRecord = ThreadItem(
+                        threadID: threadID,
+                        turnID: turnID,
+                        kind: itemType == "reasoning" ? .reasoning : .dynamicToolCall,
+                        summary: itemType,
+                        payload: .object(["item": responseItem])
+                    )
+                    try await threadManager.appendItem(responseItemRecord, to: threadID)
+                    continuation.yield(.itemCompleted(responseItemRecord))
                 case .messageCompleted(let text):
                     completedMessage = text
                 case .completed(let responseID, let usage):
@@ -250,7 +277,8 @@ public final class CodexAgent: Sendable {
                             "call_id": .string(call.callID),
                             "name": .string(call.name),
                             "arguments": .string(call.arguments),
-                            "raw_arguments": call.rawArguments ?? .null
+                            "raw_arguments": call.rawArguments ?? .null,
+                            "caller": call.caller ?? .null
                         ])
                     )
                     try await threadManager.appendItem(callItem, to: threadID)
@@ -287,13 +315,14 @@ public final class CodexAgent: Sendable {
                             "content": .string(result.content),
                             "structured_content": result.structuredContent ?? .null,
                             "is_error": .bool(result.isError),
-                            "metadata": .object(result.metadata)
+                            "metadata": .object(result.metadata),
+                            "caller": call.caller ?? .null
                         ])
                     )
                     try await threadManager.appendItem(resultItem, to: threadID)
                     continuation.yield(.toolCompleted(call: call, result: result))
                     continuation.yield(.itemCompleted(resultItem))
-                    toolOutputs.append(ResponseInputBuilder.functionCallOutput(callID: call.callID, output: result.content))
+                    toolOutputs.append(ResponseInputBuilder.functionCallOutput(callID: call.callID, output: result.content, caller: call.caller))
                 }
                 if lastResponseID != nil && modelProvider.supportsResponseContinuation {
                     responseInputs = toolOutputs
@@ -341,16 +370,39 @@ public final class CodexAgent: Sendable {
                 if let content = item.payload["content"]?.stringValue { input.append(ResponseInputBuilder.developerMessage(content)) }
             case .assistantMessage:
                 if let content = item.payload["content"]?.stringValue, !content.isEmpty { input.append(ResponseInputBuilder.assistantMessage(content)) }
-            case .toolCall, .mcpToolCall, .dynamicToolCall, .subagentToolCall:
+            case .toolCall, .mcpToolCall, .subagentToolCall:
                 if let callID = item.payload["call_id"]?.stringValue,
                    let name = item.payload["name"]?.stringValue,
                    let arguments = item.payload["arguments"]?.stringValue {
-                    input.append(ResponseInputBuilder.functionCall(ToolCall(id: item.id, callID: callID, name: name, arguments: arguments, rawArguments: item.payload["raw_arguments"])))
+                    input.append(ResponseInputBuilder.functionCall(ToolCall(
+                        id: item.id,
+                        callID: callID,
+                        name: name,
+                        arguments: arguments,
+                        rawArguments: item.payload["raw_arguments"],
+                        caller: nonNull(item.payload["caller"])
+                    )))
+                }
+            case .dynamicToolCall, .reasoning:
+                if let responseItem = item.payload["item"],
+                   let replayableItem = ResponseInputBuilder.replayableServerToolOutput(responseItem) {
+                    input.append(replayableItem)
+                } else if let callID = item.payload["call_id"]?.stringValue,
+                          let name = item.payload["name"]?.stringValue,
+                          let arguments = item.payload["arguments"]?.stringValue {
+                    input.append(ResponseInputBuilder.functionCall(ToolCall(
+                        id: item.id,
+                        callID: callID,
+                        name: name,
+                        arguments: arguments,
+                        rawArguments: item.payload["raw_arguments"],
+                        caller: nonNull(item.payload["caller"])
+                    )))
                 }
             case .toolResult:
                 if let callID = item.payload["call_id"]?.stringValue,
                    let content = item.payload["content"]?.stringValue {
-                    input.append(ResponseInputBuilder.functionCallOutput(callID: callID, output: content))
+                    input.append(ResponseInputBuilder.functionCallOutput(callID: callID, output: content, caller: nonNull(item.payload["caller"])))
                 }
             case .webSearch, .imageGeneration:
                 if let item = item.payload["item"],
@@ -364,10 +416,29 @@ public final class CodexAgent: Sendable {
         return input
     }
 
+    private func effectivePromptCacheKey(threadID: String) async throws -> String {
+        if let configured = configuration.promptCacheKey, !configured.isEmpty {
+            return configured
+        }
+        var thread = try await threadManager.getThread(id: threadID)
+        var visited = Set([thread.id])
+        while let parentID = thread.parentThreadID {
+            guard visited.insert(parentID).inserted else {
+                throw CodexCoreError.invalidState("Thread ancestry contains a cycle at \(parentID)")
+            }
+            thread = try await threadManager.getThread(id: parentID)
+        }
+        return thread.id
+    }
+
     private func decodeArguments(_ call: ToolCall) throws -> JSONValue {
         if let raw = call.rawArguments { return raw }
         guard let data = call.arguments.data(using: .utf8) else { throw CodexCoreError.invalidJSON("Tool arguments are not UTF-8") }
         return try JSONDecoder.codex.decode(JSONValue.self, from: data)
+    }
+
+    private func nonNull(_ value: JSONValue?) -> JSONValue? {
+        value == .null ? nil : value
     }
 }
 

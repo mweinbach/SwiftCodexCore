@@ -156,6 +156,9 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
     public var safetyIdentifier: String?
     public var maxOutputTokens: Int?
     public var multiAgent: MultiAgentConfiguration?
+    public var responseIncludes: [String]?
+    public var toolChoice: JSONValue?
+    public var textOptions: ResponseTextOptions?
     public var backgroundAccessEnabled: Bool
     public var projectInstructionOptions: ProjectInstructionOptions
     public var skillOptions: SkillInjectionOptions
@@ -182,6 +185,9 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
         safetyIdentifier: String? = nil,
         maxOutputTokens: Int? = nil,
         multiAgent: MultiAgentConfiguration? = nil,
+        responseIncludes: [String]? = ["reasoning.encrypted_content"],
+        toolChoice: JSONValue? = nil,
+        textOptions: ResponseTextOptions? = nil,
         backgroundAccessEnabled: Bool = false,
         projectInstructionOptions: ProjectInstructionOptions = ProjectInstructionOptions(),
         skillOptions: SkillInjectionOptions = SkillInjectionOptions(),
@@ -207,6 +213,9 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
         self.safetyIdentifier = safetyIdentifier
         self.maxOutputTokens = maxOutputTokens
         self.multiAgent = multiAgent
+        self.responseIncludes = responseIncludes
+        self.toolChoice = toolChoice
+        self.textOptions = textOptions
         self.backgroundAccessEnabled = backgroundAccessEnabled
         self.projectInstructionOptions = projectInstructionOptions
         self.skillOptions = skillOptions

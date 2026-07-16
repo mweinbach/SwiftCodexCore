@@ -21,7 +21,11 @@ public struct ResponseToolDefinition: Codable, Sendable, Equatable {
     public var parameters: JSONValue? { fields["parameters"] }
     public var requiresNetworkAccess: Bool {
         switch type {
-        case "web_search", "web_search_preview", "image_generation", "mcp":
+        case "function", "custom":
+            return false
+        case "web_search", "web_search_preview", "image_generation", "mcp", "file_search",
+             "code_interpreter", "shell", "apply_patch", "computer", "skills", "tool_search",
+             "programmatic_tool_calling":
             return true
         default:
             return false
@@ -376,6 +380,9 @@ public enum ModelStreamEvent: Sendable, Equatable {
     case toolCallDelta(callID: String, name: String?, argumentsDelta: String)
     case toolCallCompleted(ToolCall)
     case serverToolCompleted(name: String, item: JSONValue)
+    /// A replayable Responses output item such as encrypted reasoning, a
+    /// hosted program, or a Multi-agent coordination item.
+    case responseItemCompleted(JSONValue)
     case messageCompleted(String)
     case completed(responseID: String?, usage: TokenUsage?)
     case failed(String)
@@ -496,7 +503,8 @@ public enum ResponseInputBuilder {
         switch item["type"]?.stringValue {
         case "web_search_call", "image_generation_call", "file_search_call", "computer_call",
              "code_interpreter_call", "shell_call", "apply_patch_call", "mcp_call", "tool_search_call",
-             "program", "program_output", "reasoning", "multi_agent_call":
+             "program", "program_output", "reasoning", "multi_agent_call", "multi_agent_call_output",
+             "agent_message":
             return item
         default:
             return nil
