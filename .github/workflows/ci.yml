@@ -65,4 +65,49 @@ jobs:
           -destination 'generic/platform=iOS'
           -derivedDataPath "$RUNNER_TEMP/SwiftCodexCoreDerivedData"
           CODE_SIGNING_ALLOWED=NO
+          SWIFT_TREAT_WARNINGS_AS_ERRORS=YES
           build
+
+  ios-code-mode-tests:
+    name: iOS code mode host tests
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Select an available iPhone simulator
+        id: simulator
+        shell: bash
+        run: |
+          DEVICE_ID="$(
+            xcrun simctl list devices available --json | python3 -c '
+          import json
+          import re
+          import sys
+
+          devices = json.load(sys.stdin)["devices"]
+          candidates = []
+          for runtime, runtime_devices in devices.items():
+              if ".iOS-" not in runtime:
+                  continue
+              version = tuple(int(part) for part in re.findall(r"\d+", runtime.rsplit(".iOS-", 1)[1]))
+              for device in runtime_devices:
+                  if "iPhone" in device.get("deviceTypeIdentifier", ""):
+                      candidates.append((version, device["name"], device["udid"]))
+
+          if not candidates:
+              raise SystemExit("No available iPhone simulator was found")
+          print(max(candidates)[2])
+          '
+          )"
+          echo "device-id=$DEVICE_ID" >> "$GITHUB_OUTPUT"
+      - name: Run WebKit code mode tests
+        run: >-
+          xcodebuild test
+          -quiet
+          -scheme SwiftCodexCore-Package
+          -destination 'platform=iOS Simulator,id=${{ steps.simulator.outputs.device-id }}'
+          -derivedDataPath "$RUNNER_TEMP/SwiftCodexCoreDerivedData-iOS-Tests"
+          -only-testing:CodexCoreTests/CodeModeWebKitEngineTests
+          -only-testing:CodexCoreTests/CodeModeWebKitProgramTests
+          CODE_SIGNING_ALLOWED=NO
