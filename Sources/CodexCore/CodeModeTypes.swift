@@ -231,17 +231,30 @@ public struct JavaScriptCoreCodeModeEngine: CodeModeEngine {
   }
 }
 
-/// Uses the packaged process host when it is available on macOS, falling back
-/// to the in-process JavaScriptCore engine on iOS and unbundled hosts.
+/// Uses the packaged process host when it is available on macOS and the
+/// WebKit/Worker host on iOS. Unbundled macOS command-line hosts retain the
+/// JavaScriptCore fallback for compatibility with non-GUI environments.
 public struct AutomaticCodeModeEngine: CodeModeEngine {
-  public init() {}
+  #if os(iOS)
+    private let webKitEngine: WebKitCodeModeEngine
+
+    public init() {
+      self.webKitEngine = WebKitCodeModeEngine()
+    }
+  #else
+    public init() {}
+  #endif
 
   public func start(request: CodeModeExecutionRequest) -> any CodeModeCellSession {
-    #if os(macOS)
+    #if os(iOS)
+      return webKitEngine.start(request: request)
+    #elseif os(macOS)
       let processEngine = ProcessCodeModeEngine()
       if processEngine.isAvailable { return processEngine.start(request: request) }
+      return JavaScriptCoreCodeModeEngine().start(request: request)
+    #else
+      return JavaScriptCoreCodeModeEngine().start(request: request)
     #endif
-    return JavaScriptCoreCodeModeEngine().start(request: request)
   }
 }
 

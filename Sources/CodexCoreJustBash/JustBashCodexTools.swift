@@ -27,7 +27,8 @@ public enum JustBashCodexFactory {
     embeddedSkillsRootName: String = "bundled",
     embeddedSkillsRootURL: URL? = nil,
     threadStore: any ThreadStore = JSONFileThreadStore(),
-    approvalHandler: ApprovalHandler? = nil
+    approvalHandler: ApprovalHandler? = nil,
+    codeModeEngine: any CodeModeEngine = AutomaticCodeModeEngine()
   ) throws -> JustBashCodexEnvironment {
     var options = try BashOptions.codingAgentWorkspace(
       rootURL: workspaceRootURL, username: username)
@@ -47,7 +48,8 @@ public enum JustBashCodexFactory {
       modelProvider: modelProvider,
       threadStore: threadStore,
       tools: justBashCodexTools(bash: bash, defaultCWD: defaultCWD),
-      approvalHandler: approvalHandler
+      approvalHandler: approvalHandler,
+      codeModeEngine: codeModeEngine
     )
     return JustBashCodexEnvironment(
       runtime: runtime, bash: bash, workspaceRootURL: workspaceRootURL, defaultCWD: defaultCWD)

@@ -19,7 +19,10 @@ let package = Package(
   targets: [
     .target(
       name: "CodexCore",
-      linkerSettings: [.linkedFramework("JavaScriptCore")]
+      linkerSettings: [
+        .linkedFramework("JavaScriptCore"),
+        .linkedFramework("WebKit", .when(platforms: [.iOS])),
+      ]
     ),
     .target(
       name: "CodexCoreJustBash",
