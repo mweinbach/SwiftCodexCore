@@ -145,8 +145,8 @@ final class JavaScriptCoreCodeModeCell: CodeModeCellSession, @unchecked Sendable
       }
       let arguments = Self.parseJSON(rawArguments) ?? .object([:])
       do {
-        let result = try await request.registry.run(
-          name: binding.toolName, arguments: arguments, context: request.context)
+        let result = try await request.runNestedTool(
+          identifier: identifier, name: binding.toolName, arguments: arguments)
         guard !isClosed else {
           deliver(identifier: identifier, value: nil, error: "Code-mode cell was terminated.")
           return

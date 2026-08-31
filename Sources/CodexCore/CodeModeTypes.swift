@@ -181,6 +181,7 @@ public struct CodeModeCellSnapshot: Sendable, Equatable {
 }
 
 public struct CodeModeExecutionRequest: Sendable {
+  public var cellID: String
   public var source: String
   public var definitions: [ToolDefinition]
   public var registry: ToolRegistry
@@ -189,6 +190,9 @@ public struct CodeModeExecutionRequest: Sendable {
   public var options: CodeModeOptions
   public var maxOutputTokens: Int
   public var tokenCounter: any CodeModeTokenCounting
+  /// Presentation events for actual tools invoked by this cell. These do not
+  /// add nested call/result items to the model's conversation replay.
+  public var toolEventHandler: (@Sendable (AgentEvent) -> Void)?
   var notificationHandler: @Sendable (String) -> Void
 
   public init(
@@ -199,8 +203,11 @@ public struct CodeModeExecutionRequest: Sendable {
     initialStore: [String: JSONValue],
     options: CodeModeOptions,
     maxOutputTokens: Int,
-    tokenCounter: any CodeModeTokenCounting = EstimatedCodeModeTokenCounter()
+    tokenCounter: any CodeModeTokenCounting = EstimatedCodeModeTokenCounter(),
+    cellID: String = UUID().uuidString.lowercased(),
+    toolEventHandler: (@Sendable (AgentEvent) -> Void)? = nil
   ) {
+    self.cellID = cellID
     self.source = source
     self.definitions = definitions
     self.registry = registry
@@ -209,7 +216,45 @@ public struct CodeModeExecutionRequest: Sendable {
     self.options = options
     self.maxOutputTokens = maxOutputTokens
     self.tokenCounter = tokenCounter
+    self.toolEventHandler = toolEventHandler
     self.notificationHandler = { _ in }
+  }
+
+  /// Executes through the shared registry so approvals and sandbox policy are
+  /// preserved. Custom engines should use this path for nested tool calls.
+  public func runNestedTool(identifier: String, name: String, arguments: JSONValue) async throws
+    -> ToolResult
+  {
+    try Task.checkCancellation()
+    let callID = "code_mode_\(cellID)_\(identifier)"
+    let parentCallID = context.metadata["tool_call_id"]?.stringValue ?? cellID
+    let call = ToolCall(
+      id: callID,
+      callID: callID,
+      name: name,
+      arguments: String(decoding: try JSONEncoder.codexCompact.encode(arguments), as: UTF8.self),
+      rawArguments: arguments,
+      caller: .object([
+        "type": .string("program"),
+        "caller_id": .string(parentCallID),
+        "cell_id": .string(cellID),
+      ])
+    )
+    var nestedContext = context
+    nestedContext.metadata["tool_call_id"] = .string(callID)
+    nestedContext.metadata["code_mode_parent_call_id"] = .string(parentCallID)
+    nestedContext.metadata["code_mode_cell_id"] = .string(cellID)
+    nestedContext.metadata["code_mode_invocation_id"] = .string(identifier)
+    toolEventHandler?(.toolStarted(call: call))
+    do {
+      let result = try await registry.run(name: name, arguments: arguments, context: nestedContext)
+      toolEventHandler?(.toolCompleted(call: call, result: result))
+      return result
+    } catch {
+      toolEventHandler?(.toolCompleted(call: call,
+        result: ToolResult(content: String(describing: error), isError: true)))
+      throw error
+    }
   }
 }
 

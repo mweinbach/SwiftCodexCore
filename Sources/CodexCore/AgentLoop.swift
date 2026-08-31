@@ -454,6 +454,9 @@ public final class CodexAgent: Sendable {
               notificationHandler: { notification in
                 codeModeNotifications.append(notification)
                 continuation.yield(.codeModeNotification(notification))
+              },
+              toolEventHandler: { event in
+                continuation.yield(event)
               }
             )
           } else {

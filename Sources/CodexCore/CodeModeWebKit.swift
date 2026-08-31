@@ -603,10 +603,10 @@
         }
         let arguments = Self.parseJSON(rawArguments) ?? .object([:])
         do {
-          let result = try await request.registry.run(
+          let result = try await request.runNestedTool(
+            identifier: identifier,
             name: binding.toolName,
-            arguments: arguments,
-            context: request.context
+            arguments: arguments
           )
           guard !isClosed else {
             reply.reject("Code-mode cell was terminated.")

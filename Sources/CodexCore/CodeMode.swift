@@ -43,7 +43,8 @@ public actor CodeModeRuntime {
     definitions: [ToolDefinition],
     context: ToolExecutionContext,
     options: CodeModeOptions = CodeModeOptions(),
-    notificationHandler: CodeModeNotificationHandler? = nil
+    notificationHandler: CodeModeNotificationHandler? = nil,
+    toolEventHandler: (@Sendable (AgentEvent) -> Void)? = nil
   ) async -> ToolResult {
     let executionOptions: ExecutionOptions
     do {
@@ -62,7 +63,9 @@ public actor CodeModeRuntime {
       initialStore: sessionStores[context.threadID] ?? [:],
       options: options,
       maxOutputTokens: executionOptions.maxOutputTokens,
-      tokenCounter: tokenCounter
+      tokenCounter: tokenCounter,
+      cellID: cellID,
+      toolEventHandler: toolEventHandler
     )
     request.notificationHandler = { text in
       notificationHandler?(
