@@ -72,7 +72,7 @@ public struct JustBashShellTool: AgentTool {
   public let definition = ToolDefinition(
     name: "shell",
     description:
-      "Run a command in the embedded JustBash workspace and return combined stdout/stderr.",
+      "Run a command in the embedded JustBash workspace and return combined stdout/stderr. Commands use configured operation/output limits; per-command wall-clock timeouts are unavailable.",
     parameters: ToolSchemas.object(
       properties: [
         "command": ToolSchemas.string(
@@ -80,9 +80,6 @@ public struct JustBashShellTool: AgentTool {
         "cwd": ToolSchemas.string(
           description: "Optional virtual working directory inside the JustBash workspace"),
         "stdin": ToolSchemas.string(description: "Optional standard input"),
-        "timeout_seconds": .object([
-          "type": .string("number"), "description": .string("Optional timeout hint in seconds"),
-        ]),
       ], required: ["command"]),
     requiresApproval: true,
     isStateChanging: true
@@ -97,6 +94,10 @@ public struct JustBashShellTool: AgentTool {
   }
 
   public func run(arguments: JSONValue, context: ToolExecutionContext) async throws -> ToolResult {
+    guard arguments["timeout_seconds"] == nil else {
+      throw CodexCoreError.unsupported("The embedded shell does not support per-command timeout_seconds")
+    }
+    try Task.checkCancellation()
     guard context.sandboxPolicy.allowShellCommands else {
       throw CodexCoreError.approvalRequired("Shell commands are disabled by the sandbox policy")
     }
@@ -104,8 +105,10 @@ public struct JustBashShellTool: AgentTool {
       try arguments.requiredString("command"),
       options: ExecOptions(
         cwd: arguments.optionalString("cwd") ?? defaultCWD,
-        stdin: arguments.optionalString("stdin") ?? "")
+        stdin: arguments.optionalString("stdin") ?? "",
+        allowNetwork: context.sandboxPolicy.allowNetwork)
     )
+    try Task.checkCancellation()
     return JustBashToolResult.make(result)
   }
 }

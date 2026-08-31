@@ -11,6 +11,8 @@ public actor CodexRuntime {
   private let approvalHandler: ApprovalHandler?
   private let codeModeRuntime: CodeModeRuntime
   private var activeTurnsByThreadID: [String: TurnHandle] = [:]
+  private var isShutDown = false
+  public private(set) var subagentManager: SubagentManager?
 
   public init(
     configuration: AgentConfiguration = AgentConfiguration(),
@@ -37,8 +39,9 @@ public actor CodexRuntime {
 
   public func currentConfiguration() -> AgentConfiguration { configuration }
 
-  public func updateConfiguration(_ configuration: AgentConfiguration) {
+  public func updateConfiguration(_ configuration: AgentConfiguration) async {
     self.configuration = configuration
+    await subagentManager?.updateConfiguration(configuration)
   }
 
   public func appendSystemInstructions(_ text: String) {
@@ -102,6 +105,7 @@ public actor CodexRuntime {
   }
 
   public func archiveThread(id: String) async throws {
+    if let active = activeTurnsByThreadID[id] { await active.interrupt() }
     await codeModeRuntime.terminateCells(threadID: id, clearStore: true)
     try await threadManager.archiveThread(id: id)
   }
@@ -111,12 +115,17 @@ public actor CodexRuntime {
   }
 
   public func connectMCP(_ client: any MCPClient, initialize: Bool = true) async throws {
+    guard !isShutDown else { throw CodexCoreError.invalidState("Runtime was shut down") }
     guard !client.requiresNetworkAccess || configuration.sandboxPolicy.allowNetwork else {
       throw CodexCoreError.approvalRequired(
         "MCP client \(client.name) requires network access, but network is disabled by the sandbox policy"
       )
     }
     try await mcpRegistry.addClient(client, initialize: initialize)
+    if isShutDown {
+      await mcpRegistry.removeClient(named: client.name)
+      throw CancellationError()
+    }
     await mcpRegistry.registerAdapters(into: toolRegistry)
   }
 
@@ -125,7 +134,29 @@ public actor CodexRuntime {
     await mcpRegistry.registerAdapters(into: toolRegistry)
   }
 
+  public func disconnectMCP(serverName: String) async {
+    await mcpRegistry.removeClient(named: serverName)
+    await mcpRegistry.registerAdapters(into: toolRegistry)
+  }
+
+  public func disconnectAllMCP() async {
+    for name in await mcpRegistry.listClients() { await disconnectMCP(serverName: name) }
+  }
+
+  /// Closes a chat-owned runtime. Create a new runtime to resume after shutdown.
+  public func shutdown() async {
+    isShutDown = true
+    await subagentManager?.shutdown()
+    let handles = Array(activeTurnsByThreadID.values)
+    for handle in handles { await handle.interrupt() }
+    await disconnectAllMCP()
+    await toolRegistry.unregister(name: "spawn_subagent")
+    for action in SubagentControlTool.Action.allCases { await toolRegistry.unregister(name: action.rawValue) }
+    subagentManager = nil
+  }
+
   public func startTurn(threadID: String, input: TurnInput) throws -> TurnHandle {
+    guard !isShutDown else { throw CodexCoreError.invalidState("Runtime was shut down") }
     if let active = activeTurnsByThreadID[threadID] {
       throw CodexCoreError.invalidState(
         "Thread \(threadID) already has active turn \(active.turnID)")
@@ -138,27 +169,36 @@ public actor CodexRuntime {
       turnID: rawHandle.turnID,
       events: stream.stream,
       control: rawHandle.control,
-      interruptHandler: { await rawHandle.interrupt() }
+      interruptHandler: {
+        async let rootStop: Void = rawHandle.interrupt()
+        await self.subagentManager?.interruptAll()
+        await rootStop
+        await self.clearActiveTurn(threadID: threadID, turnID: rawHandle.turnID)
+      },
+      completionHandler: { await rawHandle.waitForCompletion() }
     )
     activeTurnsByThreadID[threadID] = handle
     let task = Task {
       do {
         for try await event in rawHandle.events {
           stream.continuation.yield(event)
-          if case .turnCompleted(_, let turnID, _, _) = event {
-            self.clearActiveTurn(threadID: threadID, turnID: turnID)
-          }
         }
+        await rawHandle.waitForCompletion()
         self.clearActiveTurn(threadID: threadID, turnID: rawHandle.turnID)
         stream.continuation.finish()
       } catch {
+        await rawHandle.interrupt()
         self.clearActiveTurn(threadID: threadID, turnID: rawHandle.turnID)
         stream.continuation.finish(throwing: error)
       }
     }
-    stream.continuation.onTermination = { @Sendable _ in
+    stream.continuation.onTermination = { @Sendable termination in
+      guard case .cancelled = termination else { return }
       task.cancel()
-      Task { await self.clearActiveTurn(threadID: threadID, turnID: rawHandle.turnID) }
+      Task {
+        await rawHandle.interrupt()
+        await self.clearActiveTurn(threadID: threadID, turnID: rawHandle.turnID)
+      }
     }
     return handle
   }
@@ -201,7 +241,7 @@ public actor CodexRuntime {
     }
     await handle.interrupt()
     await codeModeRuntime.terminateCells(threadID: threadID)
-    activeTurnsByThreadID.removeValue(forKey: threadID)
+    clearActiveTurn(threadID: threadID, turnID: handle.turnID)
   }
 
   public func activeTurn(threadID: String) -> TurnHandle? {
@@ -213,21 +253,31 @@ public actor CodexRuntime {
     activeTurnsByThreadID.removeValue(forKey: threadID)
   }
 
-  public func installSubagentTool(maxDepth _: Int = 4) async {
+  @discardableResult
+  public func installSubagentTool(maxDepth: Int = 4, maxConcurrentAgents: Int = 4) async -> SubagentManager {
+    if let subagentManager { return subagentManager }
     let manager = SubagentManager(
       threadManager: threadManager,
       baseConfiguration: configuration,
-      makeAgent: { [modelProvider, toolRegistry, approvalHandler] config, sharedThreadManager in
+      maxDepth: maxDepth,
+      maxConcurrentAgents: maxConcurrentAgents,
+      makeAgent: { [modelProvider, toolRegistry, approvalHandler, codeModeRuntime] config, sharedThreadManager in
         CodexAgent(
           configuration: config,
           modelProvider: modelProvider,
           toolRegistry: toolRegistry,
           threadManager: sharedThreadManager,
-          approvalHandler: approvalHandler
+          approvalHandler: approvalHandler,
+          codeModeRuntime: codeModeRuntime
         )
       }
     )
+    subagentManager = manager
     await toolRegistry.register(SpawnSubagentTool(manager: manager))
+    for action in SubagentControlTool.Action.allCases {
+      await toolRegistry.register(SubagentControlTool(manager: manager, action: action))
+    }
+    return manager
   }
 
   private func makeAgent(configuration: AgentConfiguration) -> CodexAgent {

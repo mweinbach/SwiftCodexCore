@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--check-upstream-head",
         action="store_true",
-        help="also fail when the tracked upstream branch no longer points at the pin",
+        help="also validate the focused contracts at the current upstream head",
     )
     return parser.parse_args()
 
@@ -115,10 +115,11 @@ def download(url: str) -> bytes:
         raise ParityError(f"failed to download {url}: {error}") from error
 
 
-def fetch_pinned_sources(manifest: dict[str, Any]) -> dict[str, bytes]:
+def fetch_pinned_sources(manifest: dict[str, Any], *, commit: str | None = None) -> dict[str, bytes]:
     upstream = manifest["upstream"]
     repository_path = github_repository_path(upstream["repository"])
-    commit = upstream["commit"]
+    verify_hashes = commit is None
+    commit = commit or upstream["commit"]
     fetched: dict[str, bytes] = {}
 
     for name, source in manifest["sources"].items():
@@ -126,7 +127,7 @@ def fetch_pinned_sources(manifest: dict[str, Any]) -> dict[str, bytes]:
         content = download(url)
         digest = hashlib.sha256(content).hexdigest()
         require(
-            digest == source["sha256"],
+            not verify_hashes or digest == source["sha256"],
             f"pinned source {name!r} hash mismatch: expected {source['sha256']}, got {digest}",
         )
         fetched[name] = content
@@ -319,6 +320,21 @@ def upstream_head(repository: str, branch: str) -> str:
     return fields[0]
 
 
+def validate_contracts(manifest: dict[str, Any], sources: dict[str, bytes]) -> None:
+    failures = []
+    for name, validator in [
+        ("model_catalog", validate_catalog),
+        ("tool_mode", validate_tool_mode),
+        ("raw_response_usage", validate_raw_response_usage),
+        ("mcp_encrypted_content", validate_mcp_encrypted_content),
+    ]:
+        try:
+            validator(manifest["contracts"][name], sources)
+        except ParityError as error:
+            failures.append(f"{name}: {error}")
+    require(not failures, "incompatible upstream contracts: " + "; ".join(failures))
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -326,25 +342,17 @@ def main() -> int:
         pin = manifest["upstream"]["commit"]
         print(f"OK manifest: OpenAI Codex pin {pin}")
         sources = fetch_pinned_sources(manifest)
-        validate_catalog(manifest["contracts"]["model_catalog"], sources)
-        validate_tool_mode(manifest["contracts"]["tool_mode"], sources)
-        validate_raw_response_usage(
-            manifest["contracts"]["raw_response_usage"], sources
-        )
-        validate_mcp_encrypted_content(
-            manifest["contracts"]["mcp_encrypted_content"], sources
-        )
+        validate_contracts(manifest, sources)
 
         if args.check_upstream_head:
             upstream = manifest["upstream"]
             head = upstream_head(upstream["repository"], upstream["branch"])
-            require(
-                head == pin,
-                f"upstream drift detected: {upstream['branch']} is {head}, parity pin is {pin}",
-            )
-            print(
-                f"OK upstream head: {upstream['branch']} still points at the parity pin"
-            )
+            if head == pin:
+                print(f"OK upstream head: {upstream['branch']} still points at the parity pin")
+            else:
+                print(f"INFO upstream moved: {pin} -> {head}; checking compatibility")
+                validate_contracts(manifest, fetch_pinned_sources(manifest, commit=head))
+                print("OK upstream moved without breaking the focused contracts")
     except (KeyError, TypeError, ParityError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

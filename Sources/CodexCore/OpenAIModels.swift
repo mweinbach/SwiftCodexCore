@@ -55,6 +55,9 @@ public struct OpenAIModelInfo: Codable, Sendable, Equatable, Identifiable {
   public var shellType: String? { fields["shell_type"]?.stringValue }
   public var applyPatchToolType: String? { fields["apply_patch_tool_type"]?.stringValue }
   public var webSearchToolType: String? { fields["web_search_tool_type"]?.stringValue }
+  public var supportsReasoningSummaryParameter: Bool {
+    fields["supports_reasoning_summary_parameter"]?.boolValue ?? true
+  }
   public var reasoningSummaryFormat: String? { fields["reasoning_summary_format"]?.stringValue }
   public var defaultReasoningSummary: ReasoningSummary? {
     fields["default_reasoning_summary"]?.stringValue.flatMap(ReasoningSummary.init(rawValue:))
@@ -295,10 +298,19 @@ public enum OpenAIModelCatalogRefreshStrategy: Sendable, Equatable {
 /// cache, ETag refresh signals, and a small bundled fallback.
 public actor OpenAIModelsManager {
   public struct Options: Sendable, Equatable {
+    /// Codex wire compatibility baseline from the pinned bundled model catalog.
+    /// This is independent of the host app's marketing or build version.
+    public static let defaultClientVersion = "0.144.0"
+
     public var endpoint: URL
     public var extraHeaders: [String: String]
     public var requestTimeout: TimeInterval
-    public var clientVersion: String
+    /// Sent as a whole major.minor.patch version, matching Codex's models client.
+    /// Short versions are padded; prerelease/build suffixes are removed.
+    /// Malformed values fall back to `defaultClientVersion`.
+    public var clientVersion: String {
+      didSet { clientVersion = Self.normalizedClientVersion(clientVersion) }
+    }
     public var cacheURL: URL?
     public var cacheTTL: TimeInterval
 
@@ -306,7 +318,7 @@ public actor OpenAIModelsManager {
       endpoint: URL,
       extraHeaders: [String: String] = [:],
       requestTimeout: TimeInterval = 5,
-      clientVersion: String = "0.1.0",
+      clientVersion: String = Options.defaultClientVersion,
       cacheURL: URL? = CodexDefaultLocations.coreDirectory.appendingPathComponent(
         "models_cache.json"),
       cacheTTL: TimeInterval = 300
@@ -314,17 +326,33 @@ public actor OpenAIModelsManager {
       self.endpoint = endpoint
       self.extraHeaders = extraHeaders
       self.requestTimeout = requestTimeout
-      self.clientVersion = clientVersion
+      self.clientVersion = Self.normalizedClientVersion(clientVersion)
       self.cacheURL = cacheURL
       self.cacheTTL = cacheTTL
     }
 
     public static func derivedFromResponsesEndpoint(
-      _ endpoint: URL, clientVersion: String = "0.1.0"
+      _ endpoint: URL, clientVersion: String = Options.defaultClientVersion
     ) -> Options {
       Options(
         endpoint: endpoint.deletingLastPathComponent().appendingPathComponent("models"),
         clientVersion: clientVersion)
+    }
+
+    private static func normalizedClientVersion(_ version: String) -> String {
+      let trimmed = version.trimmingCharacters(in: .whitespacesAndNewlines)
+      let pattern = #"^[0-9]+(?:\.[0-9]+){0,2}(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"#
+      guard trimmed.range(of: pattern, options: .regularExpression) != nil else {
+        return defaultClientVersion
+      }
+      let whole = trimmed.prefix { $0 != "-" && $0 != "+" }
+      var components: [String] = []
+      for component in whole.split(separator: ".") {
+        guard let number = UInt64(component) else { return defaultClientVersion }
+        components.append(String(number))
+      }
+      while components.count < 3 { components.append("0") }
+      return components.joined(separator: ".")
     }
   }
 
@@ -764,6 +792,7 @@ extension AgentConfiguration {
     {
       toolMode = mode
     }
+    supportsReasoningSummaryParameter = info.supportsReasoningSummaryParameter
     if reasoningSummary == nil {
       reasoningSummary = info.defaultReasoningSummary
     }
@@ -787,7 +816,7 @@ extension AgentConfiguration {
         allowOriginalImageDetail: info.supportsOriginalImageDetail
       )
     }
-    if configureCompaction, contextManagement == nil,
+    if configureCompaction, useResponsesLite != true, contextManagement == nil,
       let threshold = info.automaticCompactionTokenLimit
     {
       contextManagement = [ResponseContextManagement(compactThreshold: threshold)]
@@ -833,8 +862,8 @@ extension OpenAIModelInfo {
       "default_reasoning_level": .string(defaultEffort.rawValue),
       "supported_reasoning_levels": .array(
         efforts.map { .object(["effort": .string($0.rawValue)]) }),
-      "context_window": .number(372_000),
-      "max_context_window": .number(372_000),
+      "context_window": .number(272_000),
+      "max_context_window": .number(872_000),
       "supports_image_detail_original": .bool(true),
       "prefer_websockets": .bool(true),
       "support_verbosity": .bool(true),
@@ -847,9 +876,8 @@ extension OpenAIModelInfo {
       "supports_search_tool": .bool(true),
       "use_responses_lite": .bool(true),
       "include_skills_usage_instructions": .bool(false),
-      "reasoning_summary_format": .string("experimental"),
       "default_reasoning_summary": .string("none"),
-      "shell_type": .string("shell_command"),
+      "shell_type": .string("unified_exec"),
       "minimal_client_version": .string("0.144.0"),
       "tool_mode": .string("code_mode_only"),
       "multi_agent_version": .string(multiAgentVersion),

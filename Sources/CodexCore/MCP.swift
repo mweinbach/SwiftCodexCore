@@ -45,14 +45,19 @@ public struct MCPTool: Codable, Sendable, Equatable, Identifiable {
   public var name: String
   public var description: String?
   public var inputSchema: JSONValue
+  public var annotations: [String: JSONValue]?
+  public var outputSchema: JSONValue?
 
   public init(
     name: String, description: String? = nil,
-    inputSchema: JSONValue = ToolSchemas.object(properties: [:])
+    inputSchema: JSONValue = ToolSchemas.object(properties: [:]),
+    annotations: [String: JSONValue]? = nil, outputSchema: JSONValue? = nil
   ) {
     self.name = name
     self.description = description
     self.inputSchema = inputSchema
+    self.annotations = annotations
+    self.outputSchema = outputSchema
   }
 }
 
@@ -238,120 +243,226 @@ extension MCPClient {
   }
 #endif
 
-public final class StreamableHTTPMCPClient: MCPClient, Sendable {
+/// Streamable HTTP transport with stateful sessions and host-owned credentials.
+/// OAuth browser authorization remains the host's responsibility; a refreshing
+/// AuthorizationProvider can supply fresh headers without rebuilding the client.
+public actor StreamableHTTPMCPClient: MCPClient {
   public let name: String
   public let requiresNetworkAccess = true
   private let endpoint: URL
   private let bearerToken: String?
+  private let authorizationProvider: (any AuthorizationProvider)?
   private let session: URLSession
   private let idGenerator = LockedCounter()
+  private var sessionID: String?
+  private var protocolVersion = "2025-06-18"
+  private var initializeTask: Task<MCPServerInfo?, Error>?
+  private var initialized = false
+  private var serverInfo: MCPServerInfo?
+  private var closed = false
+  private var generation = UUID()
 
   public init(
-    name: String, endpoint: URL, bearerToken: String? = nil, session: URLSession = .shared
+    name: String, endpoint: URL, bearerToken: String? = nil, session: URLSession = .shared,
+    authorizationProvider: (any AuthorizationProvider)? = nil
   ) {
     self.name = name
     self.endpoint = endpoint
     self.bearerToken = bearerToken
     self.session = session
+    self.authorizationProvider = authorizationProvider
   }
 
-  public func connect() async throws {}
+  public func connect() async throws { closed = false }
 
   public func initialize() async throws -> MCPServerInfo? {
-    let result = try await send(
-      method: "initialize",
-      params: .object([
-        "protocolVersion": .string("2025-06-18"),
-        "capabilities": .object([:]),
-        "clientInfo": .object(["name": .string("SwiftCodexCore"), "version": .string("0.1.0")]),
-      ]))
-    _ = try? await sendNotification(method: "notifications/initialized", params: .object([:]))
-    if let serverInfo = result["serverInfo"]?.objectValue {
-      return MCPServerInfo(
-        name: serverInfo["name"]?.stringValue ?? name, version: serverInfo["version"]?.stringValue)
+    guard !closed else { throw CodexCoreError.invalidState("MCP client is closed") }
+    if initialized { return serverInfo }
+    if let initializeTask { return try await initializeTask.value }
+    let currentGeneration = generation
+    let task = Task { try await self.performInitialize() }
+    initializeTask = task
+    defer { if generation == currentGeneration { initializeTask = nil } }
+    return try await task.value
+  }
+
+  private func performInitialize() async throws -> MCPServerInfo? {
+    let currentGeneration = generation
+    sessionID = nil
+    let result = try await send(method: "initialize", params: .object([
+      "protocolVersion": .string(protocolVersion), "capabilities": .object([:]),
+      "clientInfo": .object(["name": .string("SwiftCodexCore"), "version": .string("0.1.0")]),
+    ]))
+    try Task.checkCancellation()
+    guard !closed, generation == currentGeneration else { throw CancellationError() }
+    if let negotiated = result["protocolVersion"]?.stringValue { protocolVersion = negotiated }
+    _ = try await sendNotification(method: "notifications/initialized", params: .object([:]))
+    try Task.checkCancellation()
+    guard !closed, generation == currentGeneration else { throw CancellationError() }
+    if let info = result["serverInfo"]?.objectValue {
+      serverInfo = MCPServerInfo(name: info["name"]?.stringValue ?? name, version: info["version"]?.stringValue)
     }
-    return nil
+    initialized = true
+    return serverInfo
   }
 
   public func listTools() async throws -> [MCPTool] {
-    let result = try await send(method: "tools/list", params: .object([:]))
-    return try parseTools(result["tools"]?.arrayValue ?? [])
+    try parseTools(await paginatedList(method: "tools/list", key: "tools"))
   }
 
   public func callTool(name: String, arguments: JSONValue) async throws -> ToolResult {
-    let result = try await send(
-      method: "tools/call", params: .object(["name": .string(name), "arguments": arguments]))
-    return parseMCPToolResult(result)
+    parseMCPToolResult(try await send(method: "tools/call", params: .object(["name": .string(name), "arguments": arguments])))
   }
 
   public func listResources() async throws -> [MCPResource] {
-    let result = try await send(method: "resources/list", params: .object([:]))
-    return (result["resources"]?.arrayValue ?? []).compactMap { value in
+    try await paginatedList(method: "resources/list", key: "resources").compactMap { value in
       guard let uri = value["uri"]?.stringValue else { return nil }
-      return MCPResource(
-        uri: uri, name: value["name"]?.stringValue, description: value["description"]?.stringValue,
-        mimeType: value["mimeType"]?.stringValue)
+      return MCPResource(uri: uri, name: value["name"]?.stringValue,
+        description: value["description"]?.stringValue, mimeType: value["mimeType"]?.stringValue)
     }
   }
 
   public func readResource(uri: String) async throws -> ToolResult {
     let result = try await send(method: "resources/read", params: .object(["uri": .string(uri)]))
-    let text = (result["contents"]?.arrayValue ?? []).compactMap { $0["text"]?.stringValue }.joined(
-      separator: "\n")
+    let text = (result["contents"]?.arrayValue ?? []).compactMap { $0["text"]?.stringValue }.joined(separator: "\n")
     return ToolResult(content: text.isEmpty ? result.description : text, structuredContent: result)
   }
 
-  public func close() async {}
+  public func close() async {
+    closed = true
+    generation = UUID()
+    initializeTask?.cancel()
+    initializeTask = nil
+    initialized = false
+    serverInfo = nil
+    let previousSessionID = sessionID
+    sessionID = nil
+    if let previousSessionID {
+      var request = URLRequest(url: endpoint, timeoutInterval: 5)
+      request.httpMethod = "DELETE"
+      request.setValue(previousSessionID, forHTTPHeaderField: "Mcp-Session-Id")
+      request.setValue(protocolVersion, forHTTPHeaderField: "MCP-Protocol-Version")
+      if let headers = try? await authorizationHeaders() {
+        for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
+        _ = try? await session.data(for: request)
+      }
+    }
+  }
+
+  private func paginatedList(method: String, key: String) async throws -> [JSONValue] {
+    var values: [JSONValue] = []
+    var cursor: String?
+    var visited: Set<String> = []
+    for _ in 0..<100 {
+      let params: JSONValue = .object(cursor.map { ["cursor": .string($0)] } ?? [:])
+      let result = try await send(method: method, params: params)
+      values.append(contentsOf: result[key]?.arrayValue ?? [])
+      guard let next = result["nextCursor"]?.stringValue, !next.isEmpty else { return values }
+      guard visited.insert(next).inserted else { throw CodexCoreError.transportError("MCP pagination repeated a cursor") }
+      cursor = next
+    }
+    throw CodexCoreError.transportError("MCP catalog exceeded 100 pages")
+  }
 
   private func send(method: String, params: JSONValue?) async throws -> JSONValue {
-    let id = idGenerator.next()
-    let request = JSONRPCRequest(id: .number(Double(id)), method: method, params: params)
+    let request = JSONRPCRequest(id: .number(Double(idGenerator.next())), method: method, params: params)
     return try await post(request: request, expectsResponse: true)
   }
 
   private func sendNotification(method: String, params: JSONValue?) async throws -> JSONValue {
-    let request = JSONRPCRequest(id: nil, method: method, params: params)
-    return try await post(request: request, expectsResponse: false)
+    try await post(request: JSONRPCRequest(id: nil, method: method, params: params), expectsResponse: false)
   }
 
-  private func post(request rpc: JSONRPCRequest, expectsResponse: Bool) async throws -> JSONValue {
-    var request = URLRequest(url: endpoint)
+  private func authorizationHeaders() async throws -> [String: String] {
+    if let authorizationProvider { return try await authorizationProvider.authorizationHeaders() }
+    return bearerToken.map { ["Authorization": "Bearer \($0)"] } ?? [:]
+  }
+
+  private func post(request rpc: JSONRPCRequest, expectsResponse: Bool, canRefresh: Bool = true) async throws -> JSONValue {
+    try Task.checkCancellation()
+    guard !closed else { throw CodexCoreError.invalidState("MCP client is closed") }
+    let currentGeneration = generation
+    var request = URLRequest(url: endpoint, timeoutInterval: 60)
     request.httpMethod = "POST"
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
-    if let bearerToken {
-      request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
-    }
+    request.setValue(protocolVersion, forHTTPHeaderField: "MCP-Protocol-Version")
+    if let sessionID { request.setValue(sessionID, forHTTPHeaderField: "Mcp-Session-Id") }
+    for (key, value) in try await authorizationHeaders() { request.setValue(value, forHTTPHeaderField: key) }
     request.httpBody = try JSONEncoder.codexCompact.encode(rpc)
-    let (data, response) = try await session.data(for: request)
-    guard let http = response as? HTTPURLResponse else {
-      throw CodexCoreError.transportError("MCP HTTP transport returned no HTTP response")
+    let (bytes, response) = try await session.bytes(for: request)
+    defer { bytes.task.cancel() }
+    guard let http = response as? HTTPURLResponse else { throw CodexCoreError.transportError("MCP HTTP transport returned no HTTP response") }
+    guard !closed, generation == currentGeneration else { throw CancellationError() }
+    if http.statusCode == 401, canRefresh, let refreshing = authorizationProvider as? any TokenRefreshingAuthorizationProvider {
+      try await refreshing.refreshNow()
+      return try await post(request: rpc, expectsResponse: expectsResponse, canRefresh: false)
     }
-    if !expectsResponse, http.statusCode == 202 { return .object([:]) }
     guard (200..<300).contains(http.statusCode) else {
-      throw CodexCoreError.transportError(
-        "MCP HTTP \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "")")
+      if http.statusCode == 404, sessionID != nil {
+        sessionID = nil
+        initialized = false
+      }
+      throw CodexCoreError.transportError("MCP HTTP \(http.statusCode); reconnect the server if its session expired")
     }
-    let text = String(data: data, encoding: .utf8) ?? ""
-    let jsonData: Data
-    if text.contains("data:") {
-      let jsonLines = text.split(separator: "\n").compactMap { line -> String? in
-        guard line.hasPrefix("data:") else { return nil }
-        let value = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-        return value == "[DONE]" ? nil : value
+    if rpc.method == "initialize", let assigned = http.value(forHTTPHeaderField: "Mcp-Session-Id") {
+      guard !assigned.isEmpty, assigned.utf8.allSatisfy({ (0x21...0x7e).contains($0) }) else {
+        throw CodexCoreError.transportError("MCP returned an invalid session ID")
       }
-      guard let last = jsonLines.last, let data = last.data(using: .utf8) else {
-        return .object([:])
+      sessionID = assigned
+    }
+    if !expectsResponse { return .object([:]) }
+    let isSSE = http.value(forHTTPHeaderField: "Content-Type")?.lowercased().contains("text/event-stream") == true
+    var data = Data()
+    var eventLines: [String] = []
+    var receivedBytes = 0
+    if isSSE {
+      // AsyncBytes.lines omits blank lines, which are SSE event boundaries.
+      var lineBytes = Data()
+      for try await byte in bytes {
+        try Task.checkCancellation()
+        receivedBytes += 1
+        guard receivedBytes <= 16 * 1024 * 1024 else { throw CodexCoreError.transportError("MCP response exceeded 16 MB") }
+        if byte == 10 {
+          if lineBytes.last == 13 { lineBytes.removeLast() }
+          let line = String(decoding: lineBytes, as: UTF8.self)
+          lineBytes.removeAll(keepingCapacity: true)
+          if line.isEmpty {
+            if let result = try decodeResponse(Data(eventLines.joined(separator: "\n").utf8), id: rpc.id) { return result }
+            eventLines.removeAll(keepingCapacity: true)
+          } else if line.hasPrefix("data:") {
+            var value = String(line.dropFirst(5))
+            if value.first == " " { value.removeFirst() }
+            if value != "[DONE]" { eventLines.append(value) }
+          }
+        } else {
+          lineBytes.append(byte)
+        }
       }
-      jsonData = data
+      if !lineBytes.isEmpty {
+        let line = String(decoding: lineBytes, as: UTF8.self)
+        if line.hasPrefix("data:") { eventLines.append(String(line.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)) }
+      }
+      data = Data(eventLines.joined(separator: "\n").utf8)
     } else {
-      jsonData = data
+      for try await byte in bytes {
+        try Task.checkCancellation()
+        data.append(byte)
+        guard data.count <= 16 * 1024 * 1024 else { throw CodexCoreError.transportError("MCP response exceeded 16 MB") }
+      }
     }
-    let responseObject = try JSONDecoder.codex.decode(JSONRPCResponse.self, from: jsonData)
-    if let error = responseObject.error {
-      throw CodexCoreError.transportError("MCP JSON-RPC error \(error.code): \(error.message)")
+    guard let result = try decodeResponse(data, id: rpc.id) else {
+      throw CodexCoreError.transportError("MCP response did not match the request ID")
     }
-    return responseObject.result ?? .object([:])
+    return result
+  }
+
+  private func decodeResponse(_ data: Data, id: JSONValue?) throws -> JSONValue? {
+    guard !data.isEmpty else { return nil }
+    let response = try JSONDecoder.codex.decode(JSONRPCResponse.self, from: data)
+    guard response.id == id else { return nil }
+    if let error = response.error { throw CodexCoreError.transportError("MCP JSON-RPC error \(error.code): \(error.message)") }
+    return response.result
   }
 }
 
@@ -365,8 +476,9 @@ public struct MCPToolAdapter: AgentTool {
       name: "mcp__\(serverName)__\(tool.name)",
       description: tool.description ?? "MCP tool \(tool.name) from server \(serverName)",
       parameters: tool.inputSchema,
-      requiresApproval: false,
-      isStateChanging: false,
+      outputSchema: tool.outputSchema,
+      requiresApproval: tool.annotations?["readOnlyHint"]?.boolValue != true,
+      isStateChanging: tool.annotations?["readOnlyHint"]?.boolValue != true,
       namespace: "mcp__\(serverName)"
     )
   }
@@ -390,19 +502,38 @@ public struct MCPToolAdapter: AgentTool {
 public actor MCPRegistry {
   private var clients: [String: any MCPClient] = [:]
   private var adapters: [String: MCPToolAdapter] = [:]
+  private var registeredAdapterNames: Set<String> = []
+  private var generations: [String: UUID] = [:]
 
   public init() {}
 
   public func addClient(_ client: any MCPClient, initialize: Bool = true) async throws {
-    clients[client.name] = client
-    try await client.connect()
-    if initialize { _ = try await client.initialize() }
-    try await refreshTools(for: client.name)
+    let generation = UUID()
+    generations[client.name] = generation
+    do {
+      try await client.connect()
+      if initialize { _ = try await client.initialize() }
+      let tools = try await client.listTools()
+      guard generations[client.name] == generation else { throw CancellationError() }
+      let previous = clients[client.name]
+      clients[client.name] = client
+      replaceTools(tools, serverName: client.name, client: client)
+      if let previous {
+        let previousObject = previous as AnyObject
+        let nextObject = client as AnyObject
+        if previousObject !== nextObject { await previous.close() }
+      }
+    } catch {
+      await client.close()
+      throw error
+    }
   }
 
   public func removeClient(named name: String) async {
-    if let client = clients.removeValue(forKey: name) { await client.close() }
-    adapters = adapters.filter { !$0.key.hasPrefix("mcp__\(name)__") }
+    generations[name] = UUID()
+    let client = clients.removeValue(forKey: name)
+    adapters = adapters.filter { $0.value.serverName != name }
+    await client?.close()
   }
 
   public func listClients() -> [String] {
@@ -417,18 +548,27 @@ public actor MCPRegistry {
       selected = clients.map { ($0.key, $0.value) }
     }
     for (name, client) in selected {
+      let generation = generations[name]
       let tools = try await client.listTools()
-      for tool in tools {
-        let adapter = MCPToolAdapter(serverName: name, tool: tool, client: client)
-        adapters[adapter.definition.name] = adapter
-      }
+      guard generations[name] == generation, clients[name] != nil else { continue }
+      replaceTools(tools, serverName: name, client: client)
+    }
+  }
+
+  private func replaceTools(_ tools: [MCPTool], serverName: String, client: any MCPClient) {
+    adapters = adapters.filter { $0.value.serverName != serverName }
+    for tool in tools {
+      let adapter = MCPToolAdapter(serverName: serverName, tool: tool, client: client)
+      adapters[adapter.definition.name] = adapter
     }
   }
 
   public func registerAdapters(into registry: ToolRegistry) async {
-    for adapter in adapters.values {
-      await registry.register(adapter)
-    }
+    let currentNames = Set(adapters.keys)
+    let obsolete = registeredAdapterNames.subtracting(currentNames)
+    let replacements: [any AgentTool] = Array(adapters.values)
+    registeredAdapterNames = currentNames
+    await registry.replaceTools(replacements, removing: obsolete)
   }
 
   public func toolDefinitions() -> [ToolDefinition] {
@@ -441,7 +581,8 @@ private func parseTools(_ values: [JSONValue]) throws -> [MCPTool] {
     guard let name = value["name"]?.stringValue else { return nil }
     return MCPTool(
       name: name, description: value["description"]?.stringValue,
-      inputSchema: value["inputSchema"] ?? ToolSchemas.object(properties: [:]))
+      inputSchema: value["inputSchema"] ?? ToolSchemas.object(properties: [:]),
+      annotations: value["annotations"]?.objectValue, outputSchema: value["outputSchema"])
   }
 }
 

@@ -35,6 +35,30 @@ public struct ProjectInstructionOptions: Codable, Sendable, Equatable {
   }
 }
 
+/// Changes model-visible paths only; discovery and file reads retain real URLs.
+public struct PromptPathMapping: Codable, Sendable, Equatable {
+  public var physicalRoot: URL
+  public var virtualRoot: String
+  public init(physicalRoot: URL, virtualRoot: String) {
+    self.physicalRoot = physicalRoot
+    self.virtualRoot = virtualRoot
+  }
+
+  public static func displayPath(_ url: URL, mappings: [PromptPathMapping]) -> String {
+    let path = url.standardizedFileURL.path
+    for mapping in mappings.sorted(by: { $0.physicalRoot.path.count > $1.physicalRoot.path.count }) {
+      let root = mapping.physicalRoot.standardizedFileURL.path
+      if path == root || path.hasPrefix(root + "/") {
+        let prefix = mapping.virtualRoot == "/" ? "" : mapping.virtualRoot.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let virtual = prefix.isEmpty ? "" : "/" + prefix
+        let suffix = String(path.dropFirst(root.count))
+        return virtual + suffix == "" ? "/" : virtual + suffix
+      }
+    }
+    return path
+  }
+}
+
 public struct SkillInjectionOptions: Codable, Sendable, Equatable {
   public var enabled: Bool
   public var explicitPrefix: String
@@ -50,6 +74,7 @@ public struct SkillInjectionOptions: Codable, Sendable, Equatable {
   /// Whether the catalog includes generic skill-usage guidance. `nil` keeps
   /// the package default and lets dynamic model metadata choose.
   public var includeUsageInstructions: Bool?
+  public var pathMappings: [PromptPathMapping]?
 
   public init(
     enabled: Bool = true,
@@ -63,7 +88,8 @@ public struct SkillInjectionOptions: Codable, Sendable, Equatable {
     allowImplicitInvocation: Bool = true,
     loadFullInstructionsForExplicitSkills: Bool = true,
     loadFullInstructionsForImplicitSkills: Bool = true,
-    includeUsageInstructions: Bool? = nil
+    includeUsageInstructions: Bool? = nil,
+    pathMappings: [PromptPathMapping]? = nil
   ) {
     self.enabled = enabled
     self.explicitPrefix = explicitPrefix
@@ -77,6 +103,7 @@ public struct SkillInjectionOptions: Codable, Sendable, Equatable {
     self.loadFullInstructionsForExplicitSkills = loadFullInstructionsForExplicitSkills
     self.loadFullInstructionsForImplicitSkills = loadFullInstructionsForImplicitSkills
     self.includeUsageInstructions = includeUsageInstructions
+    self.pathMappings = pathMappings
   }
 }
 
@@ -197,15 +224,16 @@ public enum PromptAssembler {
     sections.append(DefaultPrompts.toolLoop)
 
     var prefixItems: [JSONValue] = []
+    let pathMappings = configuration.skillOptions.pathMappings ?? []
     let projectInstructions = try ProjectInstructionLoader.load(
       options: configuration.projectInstructionOptions, workspaceURL: configuration.workspaceURL)
     for instruction in projectInstructions {
       prefixItems.append(
         ResponseInputBuilder.injectedUserInstructions(
-          title: "AGENTS.md instructions for \(instruction.path.deletingLastPathComponent().path)",
+          title: "AGENTS.md instructions for \(PromptPathMapping.displayPath(instruction.path.deletingLastPathComponent(), mappings: pathMappings))",
           body: instruction.content,
           metadata: [
-            "source": .string(instruction.path.path),
+            "source": .string(PromptPathMapping.displayPath(instruction.path, mappings: pathMappings)),
             "kind": .string("project_instructions"),
           ]
         ))
@@ -216,7 +244,8 @@ public enum PromptAssembler {
     var skillCatalog: String?
     if configuration.skillOptions.enabled, !availableSkills.isEmpty {
       skillCatalog = SkillRegistry.catalog(
-        for: availableSkills, maxCharacters: configuration.skillOptions.maxCatalogCharacters)
+        for: availableSkills, maxCharacters: configuration.skillOptions.maxCatalogCharacters,
+        pathMappings: pathMappings)
       if let skillCatalog, !skillCatalog.isEmpty {
         if configuration.skillOptions.includeUsageInstructions == false {
           sections.append(skillCatalog)
@@ -235,9 +264,10 @@ public enum PromptAssembler {
       prefixItems.append(
         ResponseInputBuilder.injectedUserInstructions(
           title: "Skill instructions: $\(skill.name)",
-          body: skill.instructions,
+          body: pathMappings.isEmpty ? skill.instructions :
+            "Skill directory: \(PromptPathMapping.displayPath(skill.directory, mappings: pathMappings))\n\n" + skill.instructions,
           metadata: [
-            "source": .string(skill.path.path),
+            "source": .string(PromptPathMapping.displayPath(skill.path, mappings: pathMappings)),
             "kind": .string("skill"),
             "skill_name": .string(skill.name),
           ]
@@ -444,12 +474,16 @@ public enum SkillRegistry {
     )
   }
 
-  public static func catalog(for skills: [AgentSkill], maxCharacters: Int) -> String {
+  public static func catalog(for skills: [AgentSkill], maxCharacters: Int,
+    pathMappings: [PromptPathMapping] = []) -> String {
     guard maxCharacters > 0 else { return "" }
     var lines: [String] = []
     var used = 0
     for skill in skills {
       var line = "- $\(skill.name): \(skill.description)"
+      if !pathMappings.isEmpty {
+        line += " (file: \(PromptPathMapping.displayPath(skill.path, mappings: pathMappings)))"
+      }
       let remaining = maxCharacters - used
       guard remaining > 0 else { break }
       if line.count > remaining {

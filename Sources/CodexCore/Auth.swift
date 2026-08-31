@@ -524,6 +524,9 @@ public actor ChatGPTAuthProvider: TokenRefreshingAuthorizationProvider {
   private let refreshSkew: TimeInterval
   private let config: CodexChatGPTAuthConfig
   private let httpClient: CodexChatGPTAuthClient
+  private var refreshTask: Task<Void, Error>?
+  private var generation = UUID()
+  private var invalidated = false
 
   public init(
     session: AuthSession,
@@ -587,17 +590,46 @@ public actor ChatGPTAuthProvider: TokenRefreshingAuthorizationProvider {
   public func currentSession() -> AuthSession { session }
 
   public func updateSession(_ newSession: AuthSession) async throws {
+    invalidated = true
+    let previous = refreshTask
+    generation = UUID()
+    let currentGeneration = generation
+    refreshTask = nil
+    previous?.cancel()
+    _ = await previous?.result
+    guard generation == currentGeneration else { throw CancellationError() }
+    invalidated = false
     session = newSession
     for store in sessionStores {
       try await store.saveSession(newSession)
     }
   }
 
+  /// Revokes this provider immediately, waits for pending writes, then removes
+  /// its saved credentials. A late refresh cannot sign the account back in.
+  public func invalidate(clearStores: Bool = true) async throws {
+    invalidated = true
+    generation = UUID()
+    let currentGeneration = generation
+    session = AuthSession(mode: .chatGPT)
+    let previous = refreshTask
+    refreshTask = nil
+    previous?.cancel()
+    _ = await previous?.result
+    guard generation == currentGeneration else { return }
+    if clearStores {
+      for store in sessionStores { try await store.clear() }
+    }
+  }
+
   public func authorizationHeaders() async throws -> [String: String] {
+    try Task.checkCancellation()
+    guard !invalidated else { throw CodexCoreError.authError("ChatGPT session was signed out") }
     if needsRefresh() {
       try await refreshNow()
     }
-    guard let token = session.accessToken, !token.isEmpty else {
+    try Task.checkCancellation()
+    guard !invalidated, let token = session.accessToken, !token.isEmpty else {
       throw CodexCoreError.authError("Missing ChatGPT access token")
     }
     var headers = ["Authorization": "Bearer \(token)"]
@@ -608,13 +640,32 @@ public actor ChatGPTAuthProvider: TokenRefreshingAuthorizationProvider {
   }
 
   public func refreshNow() async throws {
-    if let refreshHandler {
-      session = try await refreshHandler(session)
-    } else {
-      session = try await httpClient.refresh(session: session)
+    guard !invalidated else { throw CodexCoreError.authError("ChatGPT session was signed out") }
+    if let refreshTask {
+      try await refreshTask.value
+      return
     }
+    let currentGeneration = generation
+    let task = Task { try await self.performRefresh(generation: currentGeneration) }
+    refreshTask = task
+    defer { if generation == currentGeneration { refreshTask = nil } }
+    try await task.value
+  }
+
+  private func performRefresh(generation expectedGeneration: UUID) async throws {
+    let refreshed: AuthSession
+    if let refreshHandler {
+      refreshed = try await refreshHandler(session)
+    } else {
+      refreshed = try await httpClient.refresh(session: session, persist: false)
+    }
+    try Task.checkCancellation()
+    guard !invalidated, generation == expectedGeneration else { throw CancellationError() }
+    session = refreshed
     for store in sessionStores {
-      try await store.saveSession(session)
+      try Task.checkCancellation()
+      guard !invalidated, generation == expectedGeneration else { throw CancellationError() }
+      try await store.saveSession(refreshed)
     }
   }
 
@@ -651,7 +702,7 @@ public final class CodexChatGPTAuthClient: Sendable {
       state: state, pkce: pkce, redirectURI: config.redirectURI, authorizeURL: url)
   }
 
-  public func finishBrowserLogin(_ login: CodexBrowserLoginSession, callbackURL: URL) async throws
+  public func finishBrowserLogin(_ login: CodexBrowserLoginSession, callbackURL: URL, persist: Bool = true) async throws
     -> AuthSession
   {
     guard let components = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false) else {
@@ -670,7 +721,8 @@ public final class CodexChatGPTAuthClient: Sendable {
     }
     let token = try await exchangeCodeForTokens(
       code: code, pkce: login.pkce, redirectURI: login.redirectURI)
-    let authSession = try await persist(tokenResponse: token, rawIDToken: token.idToken)
+    try Task.checkCancellation()
+    let authSession = try await self.persist(tokenResponse: token, rawIDToken: token.idToken, writeToStore: persist)
     return authSession
   }
 
@@ -725,7 +777,7 @@ public final class CodexChatGPTAuthClient: Sendable {
     throw CodexCoreError.timeout("Device auth timed out after \(timeout) seconds")
   }
 
-  public func refresh(session authSession: AuthSession) async throws -> AuthSession {
+  public func refresh(session authSession: AuthSession, persist: Bool = true) async throws -> AuthSession {
     guard let refreshToken = authSession.refreshToken, !refreshToken.isEmpty else {
       throw CodexCoreError.authError("Missing ChatGPT refresh token")
     }
@@ -736,7 +788,7 @@ public final class CodexChatGPTAuthClient: Sendable {
       URLQueryItem(name: "client_id", value: config.clientID),
     ]
     let token = try await postTokenForm(form)
-    return try await persist(tokenResponse: token, rawIDToken: token.idToken)
+    return try await self.persist(tokenResponse: token, rawIDToken: token.idToken, writeToStore: persist)
   }
 
   public func exchangeCodeForTokens(code: String, pkce: PKCECodes, redirectURI: URL) async throws
@@ -764,7 +816,7 @@ public final class CodexChatGPTAuthClient: Sendable {
     return try JSONDecoder.codex.decode(TokenResponse.self, from: data)
   }
 
-  private func persist(tokenResponse token: TokenResponse, rawIDToken: String?) async throws
+  private func persist(tokenResponse token: TokenResponse, rawIDToken: String?, writeToStore: Bool = true) async throws
     -> AuthSession
   {
     let idClaims = token.idToken.flatMap(JWT.payload) ?? .object([:])
@@ -785,7 +837,7 @@ public final class CodexChatGPTAuthClient: Sendable {
         "last_refresh": .string(CodexDate.format(Date())),
       ]
     )
-    try await store.save(
+    if writeToStore { try await store.save(
       CodexAuthDotJson(
         authMode: "chatgpt",
         openaiAPIKey: nil,
@@ -797,7 +849,7 @@ public final class CodexChatGPTAuthClient: Sendable {
           rawIDToken: rawIDToken
         ),
         lastRefresh: Date()
-      ))
+      )) }
     return authSession
   }
 

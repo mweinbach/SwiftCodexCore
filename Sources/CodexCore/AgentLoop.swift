@@ -3,6 +3,7 @@ import Foundation
 public actor TurnControl {
   private var steering: [TurnInput] = []
   private var interrupted = false
+  private var finished = false
 
   public init() {}
 
@@ -10,9 +11,14 @@ public actor TurnControl {
     steering.append(input)
   }
 
-  public func interrupt() {
+  @discardableResult
+  public func interrupt() -> Bool {
+    guard !finished else { return false }
     interrupted = true
+    return true
   }
+
+  func finish() { finished = true }
 
   public func drainSteering() -> [TurnInput] {
     let values = steering
@@ -29,19 +35,22 @@ public final class TurnHandle: Sendable {
   public let events: AsyncThrowingStream<AgentEvent, Error>
   let control: TurnControl
   private let interruptHandler: (@Sendable () async -> Void)?
+  private let completionHandler: (@Sendable () async -> Void)?
 
   public init(
     threadID: String,
     turnID: String,
     events: AsyncThrowingStream<AgentEvent, Error>,
     control: TurnControl,
-    interruptHandler: (@Sendable () async -> Void)? = nil
+    interruptHandler: (@Sendable () async -> Void)? = nil,
+    completionHandler: (@Sendable () async -> Void)? = nil
   ) {
     self.threadID = threadID
     self.turnID = turnID
     self.events = events
     self.control = control
     self.interruptHandler = interruptHandler
+    self.completionHandler = completionHandler
   }
 
   public func steer(_ text: String, metadata: [String: JSONValue] = [:]) async {
@@ -53,8 +62,13 @@ public final class TurnHandle: Sendable {
   }
 
   public func interrupt() async {
-    await control.interrupt()
+    guard await control.interrupt() else { return }
     await interruptHandler?()
+  }
+
+  /// Waits for model/tool execution and code-cell cleanup without consuming events.
+  public func waitForCompletion() async {
+    await completionHandler?()
   }
 }
 
@@ -99,30 +113,40 @@ public final class CodexAgent: Sendable {
   public func startTurn(threadID: String, input: TurnInput) -> TurnHandle {
     let turnID = UUID().uuidString
     let control = TurnControl()
-    let stream = AsyncThrowingStream<AgentEvent, Error> { continuation in
-      let task = Task {
-        do {
-          try await runTurn(
-            threadID: threadID, turnID: turnID, initialInput: input, control: control,
-            continuation: continuation)
-          await codeModeRuntime.terminateCells(threadID: threadID)
-          continuation.finish()
-        } catch {
-          await codeModeRuntime.terminateCells(threadID: threadID)
-          continuation.yield(.error(String(describing: error)))
-          continuation.finish(throwing: error)
+    let stream = AsyncThrowingStream<AgentEvent, Error>.makeStream()
+    let task = Task {
+      do {
+        try await runTurn(
+          threadID: threadID, turnID: turnID, initialInput: input, control: control,
+          continuation: stream.continuation)
+        await codeModeRuntime.terminateCells(threadID: threadID)
+        await control.finish()
+        stream.continuation.finish()
+      } catch {
+        await codeModeRuntime.terminateCells(threadID: threadID)
+        await control.finish()
+        if error is CancellationError || Task.isCancelled {
+          stream.continuation.yield(
+            .turnCompleted(threadID: threadID, turnID: turnID, status: .interrupted, usage: nil))
+          stream.continuation.finish()
+        } else {
+          stream.continuation.yield(.error(String(describing: error)))
+          stream.continuation.finish(throwing: error)
         }
       }
-      continuation.onTermination = { @Sendable _ in task.cancel() }
     }
+    stream.continuation.onTermination = { @Sendable _ in task.cancel() }
     return TurnHandle(
       threadID: threadID,
       turnID: turnID,
-      events: stream,
+      events: stream.stream,
       control: control,
       interruptHandler: { [codeModeRuntime] in
+        task.cancel()
         await codeModeRuntime.terminateCells(threadID: threadID)
-      }
+        await task.value
+      },
+      completionHandler: { await task.value }
     )
   }
 
@@ -133,6 +157,7 @@ public final class CodexAgent: Sendable {
     control: TurnControl,
     continuation: AsyncThrowingStream<AgentEvent, Error>.Continuation
   ) async throws {
+    try Task.checkCancellation()
     continuation.yield(.turnStarted(threadID: threadID, turnID: turnID))
 
     let userItem = ThreadItem(
@@ -158,6 +183,7 @@ public final class CodexAgent: Sendable {
     let promptCacheKey = try await effectivePromptCacheKey(threadID: threadID)
 
     for iteration in 0..<configuration.maxToolIterations {
+      try Task.checkCancellation()
       if await control.isInterrupted() {
         status = .interrupted
         break
@@ -238,7 +264,7 @@ public final class CodexAgent: Sendable {
       let responsesLite = configuration.useResponsesLite == true
       let requestTools =
         responsesLite
-        ? toolDefinitions.filter { $0.type == "function" || $0.type == "custom" }
+        ? toolDefinitions.filter(\.isSupportedByResponsesLite)
         : toolDefinitions
       var requestInput = preparedInputForModel(responseInputs)
       var requestInstructions: String? = promptAssembly.instructions
@@ -253,7 +279,8 @@ public final class CodexAgent: Sendable {
       let useResponseContinuation =
         nextInputUsesPreviousResponse && modelProvider.supportsResponseContinuation
       let reasoningSummary =
-        configuration.multiAgent?.enabled == true ? nil : configuration.reasoningSummary
+        configuration.multiAgent?.enabled == true || configuration.supportsReasoningSummaryParameter == false
+        ? nil : configuration.reasoningSummary
       let request = ResponsesRequest(
         model: configuration.model,
         instructions: requestInstructions,
@@ -294,6 +321,7 @@ public final class CodexAgent: Sendable {
       var didStartAssistantItem = false
 
       for try await event in modelProvider.streamResponse(request) {
+        try Task.checkCancellation()
         if await control.isInterrupted() {
           status = .interrupted
           break
@@ -361,6 +389,8 @@ public final class CodexAgent: Sendable {
         }
       }
 
+      try Task.checkCancellation()
+
       if status == .interrupted { break }
 
       if !toolCalls.isEmpty {
@@ -382,6 +412,7 @@ public final class CodexAgent: Sendable {
         }
         var toolOutputs: [JSONValue] = []
         for call in toolCalls {
+          try Task.checkCancellation()
           let callItem = ThreadItem(
             id: call.id,
             threadID: threadID,
@@ -467,6 +498,7 @@ public final class CodexAgent: Sendable {
           try await threadManager.appendItem(resultItem, to: threadID)
           continuation.yield(.toolCompleted(call: call, result: result))
           continuation.yield(.itemCompleted(resultItem))
+          try Task.checkCancellation()
           toolOutputs.append(contentsOf: notificationOutputs)
           if call.kind == .custom {
             toolOutputs.append(
@@ -514,7 +546,9 @@ public final class CodexAgent: Sendable {
       break
     }
 
+    try Task.checkCancellation()
     if status == .running { status = .completed }
+    await codeModeRuntime.terminateCells(threadID: threadID)
     continuation.yield(
       .turnCompleted(threadID: threadID, turnID: turnID, status: status, usage: finalUsage))
   }

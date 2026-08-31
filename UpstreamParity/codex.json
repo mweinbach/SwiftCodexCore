@@ -3,28 +3,28 @@
   "upstream": {
     "repository": "https://github.com/openai/codex.git",
     "branch": "main",
-    "commit": "cbc83d961e8132bfff4d340ab8342d181b79e95e"
+    "commit": "d58d0e5841e0de08e251673db2d5af8cf3a1ad51"
   },
   "sources": {
     "model_catalog": {
       "path": "codex-rs/models-manager/models.json",
-      "sha256": "adc01736a3d4fce69683c24848d62900a7ba07a30571803ab79565010aadba81"
+      "sha256": "eb0d7b9a5dcaf103895c5f8a14c16b269df46e039b375a55ba97f6238542d2ed"
     },
     "model_schema": {
       "path": "codex-rs/protocol/src/openai_models.rs",
-      "sha256": "dea7eb2695b644fee838014e25490eeabd0b9d6c9e23d5e4c32a9114b02e027d"
+      "sha256": "6fd1b07d0e93ae5b98c9010233405fe9f1538ef6f53b4ce9c53386c87714bdc3"
     },
     "tool_mode_dispatch": {
       "path": "codex-rs/core/src/tools/mod.rs",
-      "sha256": "70017fc7f721a4b8e9aef5996e72dc5f2f62f4f5500afc824447db557429ca20"
+      "sha256": "0c8ec9324f67053cf7c14dac5d53504c9e8c370b84cb2323fdb0239e674572d7"
     },
     "raw_response_schema": {
       "path": "codex-rs/app-server-protocol/schema/json/v2/RawResponseCompletedNotification.json",
-      "sha256": "dab430b6c6e2ebb51d1fa2acdc597418ce68b12710382d4d93b652efd47fb61a"
+      "sha256": "ecb33556a2573cc3dddfe54e53067947767772357353dcb28f68a35f0a4415bb"
     },
     "protocol_models": {
       "path": "codex-rs/protocol/src/models.rs",
-      "sha256": "752b1d80e932ef9b662647d5bdbbdfb0e7203c6e62feec18f4e7332bbafc5b78"
+      "sha256": "533e7481858b8640e61e0d195b34ada5e45edb5989897b2651f45504a9c737f1"
     }
   },
   "contracts": {
@@ -35,15 +35,15 @@
           "slug": "gpt-5.6-sol",
           "fields": {
             "display_name": "GPT-5.6-Sol",
-            "context_window": 372000,
-            "max_context_window": 372000,
+            "context_window": 272000,
+            "max_context_window": 872000,
             "tool_mode": "code_mode_only",
             "prefer_websockets": true,
             "support_verbosity": true,
             "default_verbosity": "low",
             "apply_patch_tool_type": "freeform",
             "web_search_tool_type": "text_and_image",
-            "shell_type": "shell_command",
+            "shell_type": "unified_exec",
             "truncation_policy": {
               "mode": "tokens",
               "limit": 10000
@@ -53,7 +53,6 @@
             "supports_search_tool": true,
             "use_responses_lite": true,
             "include_skills_usage_instructions": false,
-            "reasoning_summary_format": "experimental",
             "default_reasoning_summary": "none",
             "minimal_client_version": "0.144.0",
             "input_modalities": [
@@ -63,7 +62,8 @@
             "visibility": "list",
             "supported_in_api": true,
             "default_reasoning_level": "low",
-            "multi_agent_version": "v2"
+            "multi_agent_version": "v2",
+            "supports_reasoning_summary_parameter": true
           },
           "reasoning_efforts": [
             "low",
@@ -78,15 +78,15 @@
           "slug": "gpt-5.6-terra",
           "fields": {
             "display_name": "GPT-5.6-Terra",
-            "context_window": 372000,
-            "max_context_window": 372000,
+            "context_window": 272000,
+            "max_context_window": 872000,
             "tool_mode": "code_mode_only",
             "prefer_websockets": true,
             "support_verbosity": true,
             "default_verbosity": "low",
             "apply_patch_tool_type": "freeform",
             "web_search_tool_type": "text_and_image",
-            "shell_type": "shell_command",
+            "shell_type": "unified_exec",
             "truncation_policy": {
               "mode": "tokens",
               "limit": 10000
@@ -96,7 +96,6 @@
             "supports_search_tool": true,
             "use_responses_lite": true,
             "include_skills_usage_instructions": false,
-            "reasoning_summary_format": "experimental",
             "default_reasoning_summary": "none",
             "minimal_client_version": "0.144.0",
             "input_modalities": [
@@ -106,7 +105,8 @@
             "visibility": "list",
             "supported_in_api": true,
             "default_reasoning_level": "medium",
-            "multi_agent_version": "v2"
+            "multi_agent_version": "v2",
+            "supports_reasoning_summary_parameter": true
           },
           "reasoning_efforts": [
             "low",
@@ -121,15 +121,15 @@
           "slug": "gpt-5.6-luna",
           "fields": {
             "display_name": "GPT-5.6-Luna",
-            "context_window": 372000,
-            "max_context_window": 372000,
+            "context_window": 272000,
+            "max_context_window": 872000,
             "tool_mode": "code_mode_only",
             "prefer_websockets": true,
             "support_verbosity": true,
             "default_verbosity": "low",
             "apply_patch_tool_type": "freeform",
             "web_search_tool_type": "text_and_image",
-            "shell_type": "shell_command",
+            "shell_type": "unified_exec",
             "truncation_policy": {
               "mode": "tokens",
               "limit": 10000
@@ -139,7 +139,6 @@
             "supports_search_tool": true,
             "use_responses_lite": true,
             "include_skills_usage_instructions": false,
-            "reasoning_summary_format": "experimental",
             "default_reasoning_summary": "none",
             "minimal_client_version": "0.144.0",
             "input_modalities": [
@@ -149,7 +148,8 @@
             "visibility": "list",
             "supported_in_api": true,
             "default_reasoning_level": "medium",
-            "multi_agent_version": "v1"
+            "multi_agent_version": "v1",
+            "supports_reasoning_summary_parameter": true
           },
           "reasoning_efforts": [
             "low",
@@ -170,10 +170,11 @@
         "code_mode_only"
       ],
       "model_info_fields": [
-        "supports_parallel_tool_calls",
-        "supports_search_tool",
-        "use_responses_lite",
-        "tool_mode"
+        "tool_mode",
+        "supports_reasoning_summary_parameter",
+        "context_window",
+        "max_context_window",
+        "shell_type"
       ],
       "dispatch_snippets": [
         "ToolMode::Direct",

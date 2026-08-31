@@ -16,7 +16,7 @@ A SwiftPM package that implements a Codex-style agent core in Swift:
 - dynamic Codex-style `/models` discovery with ETag refresh, scoped caching, diagnostics, and offline fallback
 - GPT-5.6 reasoning, caching, multimodal, compaction, Multi-agent, programmatic-tool, and model-advertised runtime controls
 - Codex-compatible `code_mode` and `code_mode_only` execution with `exec`, `wait`, typed content, and pluggable JavaScript engines
-- a packaged macOS code-mode helper for process-isolated JavaScript execution, with an in-process iOS fallback
+- a packaged macOS code-mode helper for process-isolated JavaScript execution, with a terminable WebKit worker host on iOS
 - built-in Responses server-tool definitions for web/file search, image generation, hosted shell, code interpreter, apply patch, skills, computer use, tool search, and remote MCP
 - high-level `CodexRuntime` facade for app/server integrations
 
@@ -30,6 +30,8 @@ The package uses Swift tools 6.0. `CodexCore` supports macOS 15 and iOS 18; desk
 swift test
 swift run codex-core-example
 ```
+
+When developing coordinated changes with the sibling JustBash checkout, use `swift package edit just-bash-swift --path ../just-bash-swift` before building this package. The editable override is local and keeps the tracked remote pin unchanged. The unreleased per-invocation network-policy adapter requires the matching sibling changes until that JustBash revision is published and pinned. Cowork's development workspace already supplies its sibling package override.
 
 The implementation is production-shaped but not production-hardened. In particular, the local file/shell sandbox is policy enforcement, not an OS-level sandbox; code-mode process isolation covers JavaScript execution but not the Swift tool implementations it invokes; ChatGPT OAuth mirrors the public Codex OAuth/cache/device-code shape but still depends on the live OpenAI auth service accepting the public client flow; and the Responses client uses one WebSocket per preferred request rather than upstream's connection pooling and prewarming optimizations.
 
@@ -48,19 +50,16 @@ python3 Scripts/check_upstream_parity.py
 
 ## GPT-5.6 and current Codex alignment
 
-The package pins focused compatibility contracts from OpenAI Codex commit [`cbc83d9`](https://github.com/openai/codex/commit/cbc83d961e8132bfff4d340ab8342d181b79e95e). Model capabilities are not treated as a permanent Swift table: `OpenAIModelsManager` queries the provider's `/models?client_version=...` endpoint, preserves unknown fields, caches the result for five minutes by default, and reacts to `X-Models-Etag` signals from Responses streams. The bundled Sol/Terra/Luna records provide first-launch and offline recovery and enrich the sparse standard OpenAI `/v1/models` shape; a detailed Codex catalog is authoritative.
+The package pins focused compatibility contracts from OpenAI Codex commit [`d58d0e5`](https://github.com/openai/codex/commit/d58d0e5841e0de08e251673db2d5af8cf3a1ad51). Model capabilities are not treated as a permanent Swift table: `OpenAIModelsManager` queries the provider's `/models?client_version=...` endpoint, preserves unknown fields, caches the result for five minutes by default, and reacts to `X-Models-Etag` signals from Responses streams. The bundled Sol/Terra/Luna records provide first-launch and offline recovery and enrich the sparse standard OpenAI `/v1/models` shape; a detailed Codex catalog is authoritative.
 
-The [public GPT-5.6 API documentation](https://developers.openai.com/api/docs/models/gpt-5.6-sol) advertises a 1,050,000-token context window and 128,000 maximum output tokens. The [pinned Codex catalog](https://github.com/openai/codex/blob/cbc83d961e8132bfff4d340ab8342d181b79e95e/codex-rs/models-manager/models.json) currently advertises a 372,000-token effective context for Sol, Terra, and Luna. Use the dynamic catalog for runtime behavior; do not assume those two limits are interchangeable.
+The [public GPT-5.6 API documentation](https://developers.openai.com/api/docs/models/gpt-5.6-sol) advertises a 1,050,000-token context window and 128,000 maximum output tokens. The [pinned Codex catalog](https://github.com/openai/codex/blob/d58d0e5841e0de08e251673db2d5af8cf3a1ad51/codex-rs/models-manager/models.json) currently advertises a 272,000-token base context and an 872,000-token maximum configurable context for Sol, Terra, and Luna. Use the dynamic catalog for runtime behavior; do not assume those two limits are interchangeable.
 
 ```swift
 let auth = try await ChatGPTAuthProvider.fromCodexAuthFile()
 let responseOptions = OpenAIResponsesClient.Options.chatGPTCodexBackend
 let models = OpenAIModelsManager(
     auth: auth,
-    options: .derivedFromResponsesEndpoint(
-        responseOptions.endpoint,
-        clientVersion: "1.0.0" // your host app version
-    )
+    options: .derivedFromResponsesEndpoint(responseOptions.endpoint)
 )
 
 let catalog = await models.catalog()
@@ -78,9 +77,11 @@ let model = OpenAIResponsesClient(
 
 `catalog()` defaults to `.onlineIfUncached`: it returns a fresh memory/disk cache, or returns a valid stale cache immediately while one single-flight refresh runs in the background. Use `.online` to await conditional ETag validation and `.offline` to prohibit network access. Cached snapshots are accepted only for the same canonical endpoint and client version, and malformed, empty, or duplicate model records are rejected. `lastDiagnostics` reports the resolution source, staleness, in-flight refresh state, ETag, fallback usage, and last error.
 
-`OpenAIModelInfo` exposes known capabilities such as exact reasoning levels, context and truncation limits, default verbosity and reasoning summary, Responses-lite preference, tool mode and tool types, image detail, search, parallel calls, WebSocket preference, Multi-agent version, and minimum client version while retaining future fields in `fields`. `applyModelDefaults` copies supported defaults into unset host configuration, including unknown reasoning-effort wire values through `reasoningEffortName`, code-mode limits, original-image policy, and automatic compaction. Explicit host choices win. When the client has the same models manager, `prefer_websockets` also selects WebSocket streaming unless `OpenAIResponsesClient.Options.supportsWebSockets` is disabled.
+`Options.defaultClientVersion` is `0.144.0`, the Codex wire compatibility baseline recorded by the pinned bundled catalog, independent of an app's marketing version. Overrides always become a whole numeric version: `1.0` becomes `1.0.0`, prerelease/build suffixes are stripped, and malformed input uses the compatibility baseline. Normalization also applies when mutating options, so request and cache identities agree.
 
-When metadata enables `use_responses_lite`, the agent uses the upstream Lite envelope: supported local tools become one canonical leading `additional_tools` developer item, assembled instructions become a developer message, top-level tools/instructions are omitted, parallel tool calls are disabled, reasoning context is forced to `all_turns`, hosted tools are filtered, and image input is normalized for Lite constraints. The low-level request encoder applies the same idempotent shaping, and standalone compaction uses the same body and internal Responses Lite header contract.
+`OpenAIModelInfo` exposes known capabilities such as exact reasoning levels, context and truncation limits, default verbosity and reasoning summary, Responses-lite preference, tool mode and tool types, image detail, search, parallel calls, WebSocket preference, Multi-agent version, and minimum client version while retaining future fields in `fields`. `applyModelDefaults` copies supported defaults into unset host configuration, including unknown reasoning-effort wire values through `reasoningEffortName`, code-mode limits, original-image policy, and automatic compaction for standard Responses. Responses Lite does not support server-side automatic compaction, so its defaults omit `context_management`. Explicit host choices remain intact for request validation. When the client has the same models manager, `prefer_websockets` also selects WebSocket streaming unless `OpenAIResponsesClient.Options.supportsWebSockets` is disabled.
+
+When metadata enables `use_responses_lite`, the agent uses the upstream Lite envelope: supported tools become one canonical leading `additional_tools` developer item, assembled instructions become a developer message, top-level tools/instructions are omitted, parallel tool calls are disabled, reasoning context is forced to `all_turns`, and image input is normalized for Lite constraints. Function/custom tools, web search, tool search, and explicit namespaces are retained; unverified hosted tool types are excluded. Network policy still controls whether hosted search is offered. The low-level request encoder applies the same idempotent shaping, and standalone compaction uses the same body and internal Responses Lite header contract.
 
 ## Code mode and tool exposure
 
@@ -229,6 +230,24 @@ try await runtime.steer(
 try await runtime.interrupt(threadID: thread.id, expectedTurnID: handle.turnID)
 ```
 
+Interruption cancels the actual turn task, stops dispatching remaining tool calls, and waits for cooperative tools and code cells to finish cleanup. A cancelled tool receives a persisted error output so the next turn can replay a complete call/result pair. `handle.waitForCompletion()` waits without consuming its event stream; a completed handle cannot interrupt later work on the same thread. Swift tool implementations must cooperate with task cancellation. The embedded JustBash adapter does not advertise a per-command wall-clock timeout because its pinned shell API cannot enforce one.
+
+For local child agents, install the bounded lifecycle tools once per chat runtime:
+
+```swift
+let agents = await runtime.installSubagentTool(maxDepth: 3, maxConcurrentAgents: 3)
+let child = try await agents.spawn(parentThreadID: thread.id, prompt: "Inspect the tests.")
+let snapshot = try await agents.wait(threadID: child.threadID, timeoutMilliseconds: 10_000)
+// snapshot.state is running, completed, interrupted, or failed.
+_ = try await agents.send(threadID: child.threadID, text: "Also inspect cancellation coverage.")
+await agents.interruptAll()
+await runtime.shutdown()
+```
+
+The model receives `spawn_agent`, `send_input`, `wait_agent`, `interrupt_agent`, and `list_agents`, plus the blocking `spawn_subagent` compatibility tool. Child threads share the configured workspace, tools, approvals, and code-mode engine. Their depth follows persisted ancestry; active and starting runs share the concurrency limit. A model can control only its descendants. Normal parent completion allows children to finish; Stop cancels chat-owned child work. `shutdown()` closes the runtime to further turns and disconnects its MCP servers. Keep one runtime per chat to retain this lifecycle across sends. `updateConfiguration` propagates new defaults and policies to future child turns while preserving explicit child model overrides; running turns retain their starting configuration.
+
+Reuse one `ChatGPTAuthProvider` for an account's model catalog and Responses clients. Concurrent expired-session requests share one refresh. After stopping account-owned runtimes, `try await auth.invalidate()` revokes the provider and clears its configured stores; a late refresh cannot restore credentials. Pass `clearStores: false` when replacing only an in-memory provider.
+
 ## MCP: stdio server
 
 ```swift
@@ -259,6 +278,10 @@ let remote = StreamableHTTPMCPClient(
 
 try await runtime.connectMCP(remote)
 ```
+
+Streamable HTTP supports negotiated protocol/session headers, paginated tool/resource catalogs, and matching JSON or SSE responses. Tool refresh and `runtime.disconnectMCP(serverName:)` remove stale adapters; disconnect attempts server-session deletion. A supplied `authorizationProvider:` can implement host-owned OAuth and token refresh, including one retry after HTTP 401. The package does not launch an OAuth browser flow or import desktop credentials automatically. An expired MCP session surfaces a reconnection error instead of silently replaying tool calls. MCP mutation tools request approval unless the server explicitly advertises `readOnlyHint` or the host's approval policy is `.never`.
+
+For virtual filesystems, set `SkillInjectionOptions.pathMappings` to `[PromptPathMapping(physicalRoot: workspaceRoot, virtualRoot: "/")]`. Skill catalogs, activated skill directories, and instruction source labels then use virtual paths while discovery and reads continue using their actual URLs.
 
 ## System prompt, project instructions, skills, and hosted tools
 

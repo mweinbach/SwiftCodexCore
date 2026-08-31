@@ -161,6 +161,25 @@ final class CodexCoreTests: XCTestCase {
     XCTAssertEqual(request.include, ["reasoning.encrypted_content"])
   }
 
+  func testModelCapabilitySuppressesUnsupportedSummaryWithoutLosingEffort() async throws {
+    let provider = RecordingModelProvider(batches: [
+      [.outputTextDelta("done"), .completed(responseID: "r1", usage: nil)]
+    ])
+    var config = AgentConfiguration(reasoningEffort: .high, reasoningSummary: .auto)
+    config.applyModelDefaults(OpenAIModelInfo(fields: [
+      "slug": .string("no-summary-model"),
+      "supports_reasoning_summary_parameter": .bool(false),
+    ]))
+    let runtime = CodexRuntime(configuration: config, modelProvider: provider, tools: [])
+    let thread = try await runtime.createThread()
+    _ = try await runtime.sendMessage(threadID: thread.id, text: "go")
+    let request = try XCTUnwrap(provider.requests.first)
+    XCTAssertEqual(request.reasoning?.effort, "high")
+    XCTAssertNil(request.reasoning?.summary)
+    XCTAssertEqual(config.reasoningSummary, .auto, "Retain the user's choice for other models")
+    XCTAssertTrue(OpenAIModelInfo(fields: [:]).supportsReasoningSummaryParameter)
+  }
+
   func testAgentLoopThreadsGPT56ControlsAndOmitsMultiAgentReasoningSummary() async throws {
     let provider = RecordingModelProvider(batches: [
       [.outputTextDelta("done"), .completed(responseID: "r1", usage: nil)]
@@ -600,7 +619,8 @@ final class CodexCoreTests: XCTestCase {
       XCTAssertEqual(body["reasoning"]?["context"]?.stringValue, "all_turns")
       let input = try XCTUnwrap(body["input"]?.arrayValue)
       XCTAssertEqual(input.first?["type"]?.stringValue, "additional_tools")
-      XCTAssertEqual(input.first?["tools"]?.arrayValue?.count, 1)
+      XCTAssertEqual(input.first?["tools"]?.arrayValue?.count, 2)
+      XCTAssertEqual(input.first?["tools"]?.arrayValue?.last?["type"]?.stringValue, "web_search")
       XCTAssertEqual(input.dropFirst().first?["role"]?.stringValue, "developer")
       XCTAssertEqual(
         input.dropFirst().first?["content"]?.arrayValue?.first?["text"]?.stringValue,
@@ -664,7 +684,7 @@ final class CodexCoreTests: XCTestCase {
       1
     )
     XCTAssertEqual(encoded["input"]?.arrayValue?.first?["type"]?.stringValue, "additional_tools")
-    XCTAssertEqual(encoded["input"]?.arrayValue?.first?["tools"]?.arrayValue?.count, 1)
+    XCTAssertEqual(encoded["input"]?.arrayValue?.first?["tools"]?.arrayValue?.count, 2)
   }
 
   func testDynamicModelsCatalogRefreshesFromCodexEndpointAndResponseETag() async throws {

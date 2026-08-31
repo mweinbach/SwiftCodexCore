@@ -284,6 +284,11 @@ public actor ToolRegistry {
     tools.removeValue(forKey: name)
   }
 
+  func replaceTools(_ replacements: [any AgentTool], removing names: Set<String>) {
+    for name in names { tools.removeValue(forKey: name) }
+    for tool in replacements { tools[tool.definition.name] = tool }
+  }
+
   public func listDefinitions() -> [ToolDefinition] {
     tools.values.map(\.definition).sorted { $0.name < $1.name }
   }
@@ -295,8 +300,10 @@ public actor ToolRegistry {
   public func run(name: String, arguments: JSONValue, context: ToolExecutionContext) async throws
     -> ToolResult
   {
+    try Task.checkCancellation()
     guard let tool = tools[name] else { throw CodexCoreError.missingTool(name) }
     try await authorizeIfNeeded(tool: tool, arguments: arguments, context: context)
+    try Task.checkCancellation()
     return try await tool.run(arguments: arguments, context: context)
   }
 

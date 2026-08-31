@@ -160,6 +160,8 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
   /// Exact wire value for a model-defined effort not yet represented by
   /// `ReasoningEffort`. When set, this takes precedence.
   public var reasoningEffortName: String?
+  /// False when the selected model rejects the reasoning.summary parameter.
+  public var supportsReasoningSummaryParameter: Bool?
   public var reasoningSummary: ReasoningSummary?
   public var reasoningMode: ReasoningMode?
   public var reasoningContext: ReasoningContext?
@@ -200,6 +202,7 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
     reasoningEffort: ReasoningEffort? = nil,
     reasoningEffortName: String? = nil,
     reasoningSummary: ReasoningSummary? = nil,
+    supportsReasoningSummaryParameter: Bool? = nil,
     reasoningMode: ReasoningMode? = nil,
     reasoningContext: ReasoningContext? = nil,
     serviceTier: String? = nil,
@@ -234,6 +237,7 @@ public struct AgentConfiguration: Codable, Sendable, Equatable {
     self.reasoningEffort = reasoningEffort
     self.reasoningEffortName = reasoningEffortName
     self.reasoningSummary = reasoningSummary
+    self.supportsReasoningSummaryParameter = supportsReasoningSummaryParameter
     self.reasoningMode = reasoningMode
     self.reasoningContext = reasoningContext
     self.serviceTier = serviceTier

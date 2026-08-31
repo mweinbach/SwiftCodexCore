@@ -4,6 +4,28 @@ import CodexCore
 import JustBash
 
 final class CodexCoreJustBashTests: XCTestCase {
+    func testShellNetworkPolicyOverridesHostAllowlistEvenWithoutApprovals() async throws {
+        let inspect = AnyBashCommand(name: "inspect-network") { _, context in
+            ExecResult(stdout: context.allowedURLPrefixes.joined(separator: ","), stderr: "", exitCode: 0)
+        }
+        let bash = Bash(options: BashOptions(customCommands: [inspect], allowedURLPrefixes: ["https://"]))
+        let tool = JustBashShellTool(bash: bash)
+        let denied = try await tool.run(arguments: .object(["command": .string("sh -c inspect-network")]),
+            context: ToolExecutionContext(threadID: "test", turnID: "test", approvalPolicy: .never, sandboxPolicy: .workspaceWrite))
+        XCTAssertEqual(denied.structuredContent?["stdout"]?.stringValue, "")
+        let allowed = try await tool.run(arguments: .object(["command": .string("inspect-network")]),
+            context: ToolExecutionContext(threadID: "test", turnID: "test", approvalPolicy: .never, sandboxPolicy: .dangerFullAccess))
+        XCTAssertEqual(allowed.structuredContent?["stdout"]?.stringValue, "https://")
+    }
+    func testShellRejectsUnsupportedTimeoutInsteadOfIgnoringIt() async throws {
+        let tool = JustBashShellTool(bash: Bash())
+        XCTAssertNil(tool.definition.parameters["properties"]?["timeout_seconds"])
+        do {
+            _ = try await tool.run(arguments: .object(["command": .string("echo unexpected"), "timeout_seconds": .number(1)]),
+                context: ToolExecutionContext(threadID: "test", turnID: "test", approvalPolicy: .never, sandboxPolicy: .workspaceWrite))
+            XCTFail("Unsupported deadlines must not silently execute")
+        } catch CodexCoreError.unsupported { }
+    }
     func testJustBashShellAndFileToolsShareWorkspace() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("SwiftCodexCoreJustBash-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }

@@ -19,6 +19,17 @@ public struct ResponseToolDefinition: Codable, Sendable, Equatable {
   public var name: String? { fields["name"]?.stringValue }
   public var description: String? { fields["description"]?.stringValue }
   public var parameters: JSONValue? { fields["parameters"] }
+  var isSupportedByResponsesLite: Bool { Self.supportsResponsesLiteToolType(type) }
+
+  static func supportsResponsesLiteToolType(_ type: String) -> Bool {
+    // Matches ToolSpec in the pinned upstream tools/src/tool_spec.rs. Namespace
+    // payloads are passed through; provider-specific namespace wrapping is not inferred.
+    switch type {
+    case "function", "custom", "namespace", "web_search", "tool_search": return true
+    default: return false
+    }
+  }
+
   public var requiresNetworkAccess: Bool {
     switch type {
     case "function", "custom":
@@ -262,15 +273,14 @@ private enum ResponsesLiteWireShape {
     if existingAdditionalTools.isEmpty {
       supportedTools =
         tools
-        .filter { $0.type == "function" || $0.type == "custom" }
+        .filter(\.isSupportedByResponsesLite)
         .map { .object($0.fields) }
     } else {
       supportedTools =
         existingAdditionalTools
         .flatMap { $0["tools"]?.arrayValue ?? [] }
         .filter {
-          let type = $0["type"]?.stringValue
-          return type == "function" || type == "custom"
+          ResponseToolDefinition.supportsResponsesLiteToolType($0["type"]?.stringValue ?? "")
         }
     }
     var seenTools = Set<JSONValue>()
@@ -534,6 +544,11 @@ public struct ResponsesRequest: Codable, Sendable, Equatable {
   }
 
   public func encode(to encoder: Encoder) throws {
+    if useResponsesLite, contextManagement?.isEmpty == false {
+      throw CodexCoreError.invalidInput(
+        "Responses Lite does not support context_management. Remove compaction settings or use the standard Responses API."
+      )
+    }
     var container = encoder.container(keyedBy: CodingKeys.self)
     try container.encode(model, forKey: .model)
     if !useResponsesLite {

@@ -1,6 +1,6 @@
 import Foundation
 
-public enum CodexCoreError: Error, Sendable, Equatable, CustomStringConvertible {
+public enum CodexCoreError: Error, LocalizedError, Sendable, Equatable, CustomStringConvertible {
     case invalidJSON(String)
     case invalidInput(String)
     case invalidState(String)
@@ -13,6 +13,8 @@ public enum CodexCoreError: Error, Sendable, Equatable, CustomStringConvertible 
     case interrupted
     case timeout(String)
     case unsupported(String)
+
+    public var errorDescription: String? { description }
 
     public var description: String {
         switch self {

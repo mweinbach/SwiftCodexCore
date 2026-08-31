@@ -11,6 +11,67 @@ final class OpenAIModelsManagerHardeningTests: XCTestCase {
         super.tearDown()
     }
 
+    func testClientVersionNormalizationReachesRequestQueryAndCacheIdentity() async throws {
+        let baseline = OpenAIModelsManager.Options.defaultClientVersion
+        let cases: [(String, String)] = [
+            ("1.0", "1.0.0"), ("2", "2.0.0"), ("3.4.5", "3.4.5"),
+            (" 1.2.3-beta.4+build.5 \n", "1.2.3"), ("01.002", "1.2.0"),
+            ("", baseline), ("cowork", baseline), ("1..0", baseline),
+            ("1.2.3.4", baseline), ("-1.0.0", baseline), ("1.2.3-", baseline),
+            ("1.2.3+", baseline), ("1.2.3-alpha..4", baseline),
+            ("18446744073709551616.0.0", baseline), ("١.0.0", baseline),
+        ]
+        let requestCount = CatalogLocked(0)
+        for (input, expected) in cases {
+            for mutateAfterInitialization in [false, true] {
+                CatalogURLProtocol.handler = { request in
+                    requestCount.withValue { $0 += 1 }
+                    let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems
+                    XCTAssertEqual(query?.filter { $0.name == "client_version" }.map(\.value), [expected])
+                    XCTAssertEqual(query?.first { $0.name == "region" }?.value, "example")
+                    return CatalogURLProtocol.response(for: request, json: Self.catalogJSON(model: "gpt-version"))
+                }
+                var options = OpenAIModelsManager.Options(
+                    endpoint: URL(string: "https://provider.test/models?region=example&client_version=stale&client_version=duplicate")!,
+                    clientVersion: mutateAfterInitialization ? baseline : input,
+                    cacheURL: nil
+                )
+                if mutateAfterInitialization { options.clientVersion = input }
+                XCTAssertEqual(options.clientVersion, expected)
+                let configuration = URLSessionConfiguration.ephemeral
+                configuration.protocolClasses = [CatalogURLProtocol.self]
+                let manager = OpenAIModelsManager(auth: CatalogAuthProvider(), options: options,
+                    session: URLSession(configuration: configuration))
+                let snapshot = try await manager.refresh()
+                XCTAssertEqual(snapshot.clientVersion, expected)
+            }
+        }
+        XCTAssertEqual(requestCount.value, cases.count * 2)
+    }
+
+    func testDerivedEndpointUsesPinnedCodexCompatibilityVersionByDefault() async throws {
+        let baseline = OpenAIModelsManager.Options.defaultClientVersion
+        XCTAssertEqual(Set(OpenAIModelInfo.gpt56FallbackCatalog.compactMap(\.minimalClientVersion)), [baseline])
+        let requestedVersion = CatalogLocked<String?>(nil)
+        CatalogURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.path, "/backend-api/codex/models")
+            requestedVersion.withValue { value in
+                value = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?
+                    .first { $0.name == "client_version" }?.value
+            }
+            return CatalogURLProtocol.response(for: request, json: Self.catalogJSON(model: "gpt-default"))
+        }
+        var options = OpenAIModelsManager.Options.derivedFromResponsesEndpoint(
+            URL(string: "https://provider.test/backend-api/codex/responses")!)
+        options.cacheURL = nil
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CatalogURLProtocol.self]
+        let manager = OpenAIModelsManager(auth: CatalogAuthProvider(), options: options,
+            session: URLSession(configuration: configuration))
+        _ = try await manager.refresh()
+        XCTAssertEqual(requestedVersion.value, baseline)
+    }
+
     func testRefreshUsesConditionalETagAndAcceptsNotModified() async throws {
         let cacheURL = temporaryCacheURL()
         defer { try? FileManager.default.removeItem(at: cacheURL.deletingLastPathComponent()) }
@@ -281,7 +342,7 @@ final class OpenAIModelsManagerHardeningTests: XCTestCase {
 
     private func makeManager(
         endpoint: URL,
-        clientVersion: String = "test-client",
+        clientVersion: String = OpenAIModelsManager.Options.defaultClientVersion,
         cacheURL: URL? = nil,
         cacheTTL: TimeInterval = 300
     ) -> OpenAIModelsManager {
